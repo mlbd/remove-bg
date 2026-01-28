@@ -246,105 +246,35 @@ def health():
     })
 
 
-@app.post("/remove-bg")
+@app.route("/remove-bg", methods=["POST"])
 def remove_bg():
-    f = request.files.get("image") or request.files.get("file")
-    if not f:
-        return jsonify({"error": "Upload a file as multipart/form-data with field name 'image' (or 'file')."}), 400
-
-    in_bytes = f.read()
-    if not in_bytes:
-        return jsonify({"error": "Empty upload."}), 400
-
     try:
-        original = pil_open_safely(in_bytes)
-    except Exception:
-        return jsonify({"error": "Unsupported or corrupted image file."}), 400
-
-    original_rgba = to_rgba(original)
-
-    is_logo = estimate_logo_like(original_rgba)
-
-    # Resize for model inference
-    max_side = LOGO_MAX_SIDE_FOR_MODEL if is_logo else PHOTO_MAX_SIDE_FOR_MODEL
-    small = resize_max_side(original_rgba, max_side=max_side)
-
-    # Use rembg on the smaller image bytes
-    small_buf = io.BytesIO()
-    small.save(small_buf, format="PNG")
-    small_png = small_buf.getvalue()
-
-    if is_logo:
-        model_primary = MODEL_PRIMARY_LOGO
-        model_fallback = MODEL_FALLBACK_LOGO
-        alpha_matting = False  # logos usually want crisp edges; we refine ourselves
-    else:
-        model_primary = MODEL_PRIMARY_PHOTO
-        model_fallback = MODEL_FALLBACK_PHOTO
-        alpha_matting = True   # photos benefit from alpha matting :contentReference[oaicite:4]{index=4}
-
-    # Try primary model
-    try:
-        out_primary = rembg_cli_remove(small_png, model=model_primary, alpha_matting=alpha_matting)
-        _, a1 = extract_alpha(out_primary)
-        score1 = alpha_quality_score(a1)
-    except Exception as e:
-        out_primary = None
-        a1 = None
-        score1 = -1.0
-
-    # Fallback if needed
-    use_fallback = (out_primary is None)
-    if not use_fallback and a1 is not None:
-        # If alpha looks “almost nothing removed” or “everything removed”, fallback
-        mean_a = float(a1.mean())
-        if mean_a > 250.0 or mean_a < 5.0 or score1 < 0.55:
-            use_fallback = True
-
-    if use_fallback:
-        try:
-            out_fallback = rembg_cli_remove(small_png, model=model_fallback, alpha_matting=alpha_matting)
-            _, a2 = extract_alpha(out_fallback)
-            score2 = alpha_quality_score(a2)
-            alpha_small = a2
-            model_used = model_fallback
-        except Exception as e:
-            # If both fail, return an error that helps debugging
+        f = get_uploaded_file()
+        if not f:
             return jsonify({
-                "error": "Background removal failed with both models.",
-                "primary_model": model_primary,
-                "fallback_model": model_fallback,
-                "hint": "Try a different input image or increase REMBG_TIMEOUT_SEC / reduce image size.",
-            }), 500
-    else:
-        alpha_small = a1
-        model_used = model_primary
+                "error": "No file received",
+                "content_type": request.content_type,
+                "files_keys": list(request.files.keys()),
+                "form_keys": list(request.form.keys()),
+            }), 400
 
-    # Refinement
-    if is_logo:
-        alpha_small = refine_alpha_for_logo(alpha_small)
-        # Keep edges a bit sharper for logos
-        # (still safe to do a tiny blur if needed — disabled by default)
-    else:
-        alpha_small = refine_alpha_for_photo(alpha_small)
+        data = f.read()
+        if not data:
+            return jsonify({"error": "Empty file received"}), 400
 
-    # Apply upscaled alpha to original high-res image
-    out_png = apply_alpha_to_original(
-        original_rgba=original_rgba,
-        alpha_small=alpha_small,
-        small_size=small.size,
-    )
+        # TODO: run your rembg/PIL pipeline using `data`
+        # result_bytes = ...
 
-    # Return
-    resp = send_file(
-        io.BytesIO(out_png),
-        mimetype="image/png",
-        as_attachment=False,
-        download_name="output.png",
-    )
-    resp.headers["X-Model-Used"] = model_used
-    resp.headers["X-Logo-Like"] = "1" if is_logo else "0"
-    return resp
+        # return send_file(BytesIO(result_bytes), mimetype="image/png")
+        return jsonify({"ok": True, "filename": f.filename, "size": len(data)})
+
+    except Exception as e:
+        return jsonify({
+            "error": "Server failed processing",
+            "detail": str(e),
+            "content_type": request.content_type,
+            "files_keys": list(request.files.keys()),
+        }), 500
 
 
 if __name__ == "__main__":
