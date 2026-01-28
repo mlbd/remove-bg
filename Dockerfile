@@ -1,50 +1,26 @@
-# Background Removal API Dockerfile
-# Optimized for Coolify deployment
-
 FROM python:3.11-slim-bookworm
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    libgl1-mesa-glx \
-    curl \
     && rm -rf /var/lib/apt/lists/*
-
-# Set environment variables
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    U2NET_HOME=/app/.u2net \
-    OMP_NUM_THREADS=1 \
-    FLASK_DEBUG=false \
-    PORT=5000
 
 WORKDIR /app
 
-# Copy requirements first for better caching
-COPY requirements.txt .
+# IMPORTANT: rembg downloads models to ~/.u2net/
+# We set HOME to a folder you can mount as a persistent volume in Coolify.
+ENV HOME=/models
+RUN mkdir -p /models
 
-# Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt && \
-    # Clean pip cache
-    rm -rf /root/.cache/pip/*
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Create directory for model cache
-RUN mkdir -p ${U2NET_HOME}
+COPY app.py ./
 
-# Copy application
-COPY app.py .
+EXPOSE 5000
 
-# Health check (for Coolify monitoring)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/health || exit 1
+# Configurable via env
+ENV GUNICORN_WORKERS=1
+ENV GUNICORN_TIMEOUT=180
 
-# Expose port
-EXPOSE ${PORT}
-
-# Run with gunicorn (production server)
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "2", "--threads", "2", "--timeout", "120", "--access-logfile", "-", "--error-logfile", "-"]
+CMD ["sh", "-c", "gunicorn app:app --bind 0.0.0.0:5000 --workers ${GUNICORN_WORKERS} --timeout ${GUNICORN_TIMEOUT}"]

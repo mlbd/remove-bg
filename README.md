@@ -1,23 +1,30 @@
-# Background Removal API
+# Background Remover API (remove.bg-like, self-hosted)
 
-Professional AI-powered background removal service similar to remove.bg. Built with Flask and U²-Net models.
+This API removes background from photos/logos and returns a transparent PNG.
 
-## Features
+## What makes it better than basic rembg?
 
-- 🚀 **High-quality background removal** using state-of-the-art AI models
-- 🎯 **Multiple AI models** for different use cases
-- 📦 **Bulk processing** (up to 5 images at once)
-- 🎨 **Background replacement** with colors or other images
-- 📊 **Image analysis** for optimal settings
-- 🔒 **API key authentication**
-- 📈 **Health monitoring and statistics**
-- 🐳 **Docker support** optimized for Coolify
+- Uses stronger models: BRIA RMBG + BiRefNet fallback
+- Auto-detects "logo-like" vs "photo-like" and chooses different refinement
+- Upscales alpha to keep original resolution
+- Adds halo/fringe cleanup for solid-color backgrounds
 
-## Quick Start
+> Licensing note:
+> BRIA RMBG-1.4 is non-commercial by default. Commercial use requires a BRIA license.
 
-### 1. Clone the repository
+## Endpoints
+
+### Health
+
+GET /health
+
+### Remove background
+
+POST /remove-bg
+Form-data: `image` (or `file`) = your upload
+
+Example:
 
 ```bash
-git clone https://github.com/yourusername/background-removal-api.git
-cd background-removal-api
+curl -s -F image=@input.jpg http://localhost:5000/remove-bg -o output.png
 ```
