@@ -252,6 +252,8 @@ def health():
     })
 
 
+
+
 @app.route("/remove-bg", methods=["POST"])
 def remove_bg():
     try:
@@ -268,11 +270,18 @@ def remove_bg():
         if not data:
             return jsonify({"error": "Empty file received"}), 400
 
-        # TODO: run your rembg/PIL pipeline using `data`
-        # result_bytes = ...
+        out_bytes = remove(data)  # returns PNG bytes with transparent background
 
-        # return send_file(BytesIO(result_bytes), mimetype="image/png")
-        return jsonify({"ok": True, "filename": f.filename, "size": len(data)})
+        filename = f.filename or "output.png"
+        stem = Path(filename).stem
+        out_name = f"{stem}-nobg.png"
+
+        return send_file(
+            BytesIO(out_bytes),
+            mimetype="image/png",
+            as_attachment=False,
+            download_name=out_name,
+        )
 
     except Exception as e:
         return jsonify({
