@@ -234,6 +234,12 @@ def apply_alpha_to_original(original_rgba: Image.Image, alpha_small: np.ndarray,
     out.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
 
+def get_uploaded_file():
+    # Accept both common keys and fallback to "first file"
+    f = request.files.get("image") or request.files.get("file")
+    if not f and request.files:
+        f = next(iter(request.files.values()))
+    return f
 
 @app.get("/health")
 def health():
