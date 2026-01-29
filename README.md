@@ -21,7 +21,7 @@ GET /health
 ### Remove background
 
 POST /remove-bg
-Form-data: `image` (or `file`) = your upload
+Form-data: `image` (or `file`) = your upload ( required )
 
 Example:
 
