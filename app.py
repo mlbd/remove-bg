@@ -915,62 +915,48 @@ def image_to_base64(img):
     return base64.b64encode(buffer.getvalue()).decode('utf-8')
 
 
-def upload_images_to_ftp(images_dict, folder_id):
-    """
-    Upload multiple images to FTP in a unique folder
-    
-    Args:
-        images_dict: dict of {filename: PIL_Image}
-        folder_id: unique folder name to create
-    
-    Returns:
-        dict of {filename: url} and status message
-    """
-    if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL]):
-        return None, "FTP not configured (set FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL)"
-    
-    urls = {}
-    
-    try:
-        # Connect to FTP
-        ftp = ftplib.FTP(FTP_HOST)
-        ftp.login(FTP_USER, FTP_PASS)
-        
-        # Navigate to base directory
-        if FTP_DIR:
-            try:
-                ftp.cwd(FTP_DIR)
-            except ftplib.error_perm:
-                # Try to create base directory
-                ftp.mkd(FTP_DIR)
-                ftp.cwd(FTP_DIR)
-        
-        # Create unique folder for this batch
+def ensure_ftp_dir(ftp, path):
+    if not path or path == "/":
+        return
+    parts = path.strip("/").split("/")
+    for part in parts:
         try:
-            ftp.mkd(folder_id)
+            ftp.cwd(part)
         except ftplib.error_perm:
-            pass  # Folder might already exist
-        
-        ftp.cwd(folder_id)
-        
-        # Upload each image
+            ftp.mkd(part)
+            ftp.cwd(part)
+
+def upload_images_to_ftp(images_dict, folder_id):
+
+    if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL]):
+        return None, "FTP not configured"
+
+    urls = {}
+
+    try:
+        ftp = ftplib.FTP(FTP_HOST, timeout=30)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.set_pasv(True)
+
+        # Ensure base directory exists (supports nested paths)
+        ensure_ftp_dir(ftp, FTP_DIR)
+
+        # Ensure batch folder exists
+        ensure_ftp_dir(ftp, folder_id)
+
         for filename, pil_img in images_dict.items():
-            img_buffer = BytesIO()
-            pil_img.save(img_buffer, format='PNG', optimize=True)
-            img_buffer.seek(0)
-            
-            ftp.storbinary(f'STOR {filename}', img_buffer)
-            
-            # Build public URL
-            # FTP_BASE_URL should be the full public base URL including any subdirectories
-            # e.g., https://lukpaluk.xyz/smart-logo-versions/uploads
-            # We only append folder_id and filename (FTP_DIR is for FTP navigation only)
-            base_url = FTP_BASE_URL.rstrip('/')
+            buffer = BytesIO()
+            pil_img.save(buffer, format="PNG", optimize=True)
+            buffer.seek(0)
+
+            ftp.storbinary(f"STOR {filename}", buffer)
+
+            base_url = FTP_BASE_URL.rstrip("/")
             urls[filename] = f"{base_url}/{folder_id}/{filename}"
-        
+
         ftp.quit()
         return urls, "success"
-    
+
     except Exception as e:
         return None, str(e)
 
