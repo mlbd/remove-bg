@@ -10,7 +10,6 @@ import zipfile
 import tempfile
 import ftplib
 import uuid
-import time
 from datetime import datetime
 
 app = Flask(__name__)
@@ -77,42 +76,11 @@ def health():
 # ============================================================
 # REMOVE-BG: Professional Background Removal (remove.bg quality)
 # ============================================================
-def has_transparency(img):
-    """
-    Check if an image already has meaningful transparency.
-    Returns True if the image has significant transparent or semi-transparent pixels.
-    
-    This allows us to skip processing for images that are already transparent PNGs.
-    """
-    # Convert to RGBA if needed
-    if img.mode != 'RGBA':
-        if img.mode == 'P' and 'transparency' in img.info:
-            # Palette mode with transparency
-            img = img.convert('RGBA')
-        else:
-            # No alpha channel, definitely not transparent
-            return False
-    
-    # Get alpha channel
-    alpha = np.array(img.split()[3])
-    
-    # Check if there are any non-fully-opaque pixels
-    non_opaque_pixels = np.sum(alpha < 255)
-    total_pixels = alpha.size
-    
-    # Consider transparent if more than 1% of pixels are not fully opaque
-    transparency_ratio = non_opaque_pixels / total_pixels
-    
-    # Also check if there's actual variation in alpha (not just all 255 or all 0)
-    alpha_std = np.std(alpha)
-    
-    return transparency_ratio > 0.01 and alpha_std > 10
-
 
 def analyze_image_for_bg_removal(img):
     """
-    Analyze image characteristics to determine best removal strategy.
-    Enhanced version with better detection for text and graphics.
+    Analyze image characteristics to determine best removal strategy
+    Returns dict with analysis results
     """
     img_rgb = img.convert('RGB')
     data = np.array(img_rgb)
@@ -124,8 +92,7 @@ def analyze_image_for_bg_removal(img):
         'bg_coverage': 0,
         'is_graphic': False,
         'color_complexity': 0,
-        'edge_sharpness': 0,
-        'has_small_text': False
+        'edge_sharpness': 0
     }
     
     # 1. Analyze corners for solid background
@@ -140,15 +107,15 @@ def analyze_image_for_bg_removal(img):
     
     # Also sample edge midpoints
     edge_samples = [
-        data[0:corner_size, w//2-corner_size//2:w//2+corner_size//2],
-        data[h-corner_size:h, w//2-corner_size//2:w//2+corner_size//2],
-        data[h//2-corner_size//2:h//2+corner_size//2, 0:corner_size],
-        data[h//2-corner_size//2:h//2+corner_size//2, w-corner_size:w],
+        data[0:corner_size, w//2-corner_size//2:w//2+corner_size//2],  # top
+        data[h-corner_size:h, w//2-corner_size//2:w//2+corner_size//2],  # bottom
+        data[h//2-corner_size//2:h//2+corner_size//2, 0:corner_size],  # left
+        data[h//2-corner_size//2:h//2+corner_size//2, w-corner_size:w],  # right
     ]
     
     all_border_samples = corners + edge_samples
     
-    # Calculate color stats
+    # Calculate color stats for each sample
     sample_means = []
     sample_stds = []
     for sample in all_border_samples:
@@ -156,93 +123,50 @@ def analyze_image_for_bg_removal(img):
         sample_means.append(np.mean(pixels, axis=0))
         sample_stds.append(np.std(pixels))
     
+    # Check if borders have consistent color (solid background indicator)
     mean_of_means = np.mean(sample_means, axis=0)
     std_between_samples = np.std(sample_means, axis=0).mean()
     avg_internal_std = np.mean(sample_stds)
     
-    # Solid background detection
+    # Solid background: low variation within samples AND between samples
     if avg_internal_std < 20 and std_between_samples < 25:
         analysis['has_solid_bg'] = True
         analysis['bg_color'] = mean_of_means.astype(np.uint8)
         
-        # Calculate background coverage
+        # Calculate how much of image is this background color
         tolerance = 30
         bg_mask = np.all(np.abs(data.astype(np.int16) - analysis['bg_color'].astype(np.int16)) < tolerance, axis=2)
         analysis['bg_coverage'] = np.sum(bg_mask) / (h * w)
     
-    # 2. Analyze color complexity
+    # 2. Analyze color complexity (logos typically have fewer colors)
+    # Quantize to reduce noise
     quantized = (data // 32) * 32
     unique_colors = len(np.unique(quantized.reshape(-1, 3), axis=0))
-    analysis['color_complexity'] = unique_colors / (h * w)
+    max_possible = (h * w)
+    analysis['color_complexity'] = unique_colors / max_possible
     
+    # Graphics/logos typically have < 5% color complexity
     if analysis['color_complexity'] < 0.05:
         analysis['is_graphic'] = True
     
-    # 3. Analyze edge sharpness
+    # 3. Analyze edge sharpness (graphics have sharp edges, photos have gradients)
     gray = cv2.cvtColor(data, cv2.COLOR_RGB2GRAY)
     laplacian = cv2.Laplacian(gray, cv2.CV_64F)
     analysis['edge_sharpness'] = np.var(laplacian)
     
-    # 4. Detect small text (important for RMBG-1.4 decision)
-    # Small text often has high-frequency details that benefit from AI models
-    edges = cv2.Canny(gray, 50, 150)
-    
-    # Detect small connected components (potential text)
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(edges, connectivity=8)
-    
-    small_components = 0
-    for i in range(1, num_labels):  # Skip background (0)
-        area = stats[i, cv2.CC_STAT_AREA]
-        if 10 < area < 500:  # Small components typical of text
-            small_components += 1
-    
-    if small_components > 50:  # Many small components suggest text
-        analysis['has_small_text'] = True
-    
     return analysis
-
-
-def remove_bg_rmbg14(img_bytes):
-    """
-    Remove background using RMBG-1.4 model (BRIA AI)
-    
-    RMBG-1.4 is specifically designed for:
-    - High-quality edge preservation
-    - Better handling of fine details (hair, text, etc.)
-    - Improved performance on graphics and logos
-    - More accurate alpha matting
-    """
-    try:
-        from rembg import remove, new_session
-        
-        # Use RMBG-1.4 model - better quality than isnet-general-use
-        session = new_session('u2net')  # RMBG-1.4 uses u2net architecture
-        
-        output_bytes = remove(
-            img_bytes,
-            session=session,
-            # Alpha matting settings optimized for text and fine details
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=270,  # Higher = more aggressive foreground detection
-            alpha_matting_background_threshold=5,     # Lower = more aggressive background removal
-            alpha_matting_erode_size=5,               # Smaller = preserve fine details better
-            post_process_mask=True,                   # Clean up mask artifacts
-            # Additional tuning
-            only_mask=False,
-            bgcolor=None
-        )
-        
-        return Image.open(BytesIO(output_bytes)).convert('RGBA'), True
-        
-    except Exception as e:
-        print(f"RMBG-1.4 removal failed: {e}")
-        return None, False
 
 
 def remove_bg_color_method(img, bg_color=None, tolerance=25):
     """
-    Enhanced color-based background removal with better text preservation.
-    Uses flood fill to ensure only border-connected background is removed.
+    Color-based background removal - perfect for logos/graphics
+    
+    KEY PRINCIPLE: Only remove pixels that are:
+    1. Similar to background color AND
+    2. Connected to the image border (via flood fill)
+    
+    This ensures we NEVER remove interior content, even if it's 
+    similar in color to the background (like white text on gray bg)
     """
     img_rgba = img.convert('RGBA')
     data = np.array(img_rgba)
@@ -263,76 +187,111 @@ def remove_bg_color_method(img, bg_color=None, tolerance=25):
     
     bg_color = np.array(bg_color, dtype=np.float32)
     
-    # Calculate color distance
+    # Calculate color distance from background for each pixel
     color_diff = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
     
-    # Potential background pixels
+    # Create binary mask: pixels that COULD be background (within tolerance)
     potential_bg = (color_diff < tolerance).astype(np.uint8) * 255
     
-    # Flood fill from borders
+    # Use flood fill from corners and edge midpoints
     work = potential_bg.copy()
     
-    # Comprehensive border seeding
-    seeds = [
-        (0, 0), (w-1, 0), (0, h-1), (w-1, h-1),  # corners
-        (w//2, 0), (w//2, h-1), (0, h//2), (w-1, h//2)  # edge midpoints
-    ]
-    
-    # Additional edge seeds for thorough coverage
-    step = max(1, min(w, h) // 20)
-    for x in range(0, w, step):
-        seeds.extend([(x, 0), (x, h-1)])
-    for y in range(0, h, step):
-        seeds.extend([(0, y), (w-1, y)])
-    
-    # Perform flood fill from all seeds
-    for seed in seeds:
-        if 0 <= seed[0] < w and 0 <= seed[1] < h and work[seed[1], seed[0]] > 0:
+    # Flood fill from corners
+    for seed in [(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)]:
+        if work[seed[1], seed[0]] > 0:
             mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
             cv2.floodFill(work, mask, seed, 128)
     
-    # Connected background
+    # Flood fill from edge midpoints
+    for seed in [(w//2, 0), (w//2, h-1), (0, h//2), (w-1, h//2)]:
+        if work[seed[1], seed[0]] > 0:
+            mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            cv2.floodFill(work, mask, seed, 128)
+    
+    # Additional flood fills along edges for complete coverage
+    step = max(1, min(w, h) // 20)
+    for x in range(0, w, step):
+        for y_seed in [0, h-1]:
+            if work[y_seed, x] > 0:
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(work, mask, (x, y_seed), 128)
+    for y in range(0, h, step):
+        for x_seed in [0, w-1]:
+            if work[y, x_seed] > 0:
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(work, mask, (x_seed, y), 128)
+    
+    # Connected background is where we flood filled to value 128
     connected_bg = (work == 128).astype(np.uint8) * 255
     
-    # Create alpha channel
+    # Create alpha channel - start fully opaque
     alpha = np.ones((h, w), dtype=np.float32) * 255
+    
+    # Only the connected background becomes transparent
     alpha[connected_bg > 0] = 0
     
-    # Enhanced edge anti-aliasing for smoother text
+    # Anti-alias the edges for smooth transitions
     kernel = np.ones((3, 3), np.uint8)
     dilated = cv2.dilate(connected_bg, kernel, iterations=1)
     edge_mask = (dilated > 0) & (connected_bg == 0)
     
-    # Smoother alpha transition at edges
+    # For edge pixels, create soft alpha based on color distance
     edge_alpha = np.clip(color_diff / tolerance * 255, 0, 255)
     alpha[edge_mask] = np.minimum(alpha[edge_mask], edge_alpha[edge_mask])
     
-    # Apply bilateral filter for edge-preserving smoothing
-    # This is crucial for text - smooths edges without blurring sharp transitions
-    alpha = cv2.bilateralFilter(alpha.astype(np.uint8), 5, 50, 50).astype(np.float32)
+    # Slight Gaussian blur for smoother edges
+    alpha = cv2.GaussianBlur(alpha.astype(np.float32), (3, 3), 0)
     
-    # Apply alpha
+    # Apply alpha to image
     result = data.copy()
     result[:, :, 3] = alpha.astype(np.uint8)
     
     return Image.fromarray(result, 'RGBA')
 
 
+def remove_bg_ai_method(img_bytes, model='isnet-general-use'):
+    """
+    AI-based background removal using rembg
+    Best for photos with complex backgrounds
+    """
+    try:
+        from rembg import remove, new_session
+        
+        session = new_session(model)
+        output_bytes = remove(
+            img_bytes,
+            session=session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10,
+            post_process_mask=True
+        )
+        
+        return Image.open(BytesIO(output_bytes)).convert('RGBA'), True
+        
+    except ImportError:
+        return None, False
+    except Exception as e:
+        return None, False
+
+
 def count_content_pixels(img_rgba, min_alpha=20):
-    """Count pixels with meaningful content"""
+    """Count pixels that have meaningful content (not transparent)"""
     data = np.array(img_rgba)
     return np.sum(data[:, :, 3] > min_alpha)
 
 
 def remove_bg_smart(img_bytes):
     """
-    Smart background removal with RMBG-1.4 support and improved logic.
+    Smart background removal that automatically chooses the best method
+    Similar to how remove.bg works - tries to preserve all content
     
     Strategy:
     1. Analyze image characteristics
-    2. For logos/graphics with solid backgrounds → Color-based (preserves all details)
-    3. For complex backgrounds or images with text → RMBG-1.4 AI model
-    4. Validate and fallback if needed
+    2. For solid backgrounds: Use color-based (preserves all content)
+    3. For complex backgrounds: Use AI model
+    4. Validate result has reasonable content preserved
     """
     img = Image.open(BytesIO(img_bytes))
     original_pixels = img.width * img.height
@@ -343,34 +302,34 @@ def remove_bg_smart(img_bytes):
     method_used = None
     result_img = None
     
-    # Decision logic
-    # Use color method for clear solid backgrounds
+    # Decision logic - prefer color-based for solid backgrounds
     use_color_method = (
         analysis['has_solid_bg'] and 
-        analysis['bg_coverage'] > 0.15 and  # At least 15% is background
-        not analysis['has_small_text']  # No small text that might benefit from AI
+        analysis['bg_coverage'] > 0.10  # At least 10% is background
     ) or (
         analysis['is_graphic'] and 
-        analysis['color_complexity'] < 0.03 and
-        not analysis['has_small_text']
+        analysis['color_complexity'] < 0.05
     )
     
     if use_color_method:
-        # Adaptive tolerance based on background brightness
+        # Determine tolerance based on background color
+        # For light backgrounds (like gray/white), use LOWER tolerance
+        # to avoid removing light-colored content
         bg_color = analysis.get('bg_color')
         if bg_color is not None:
             bg_brightness = np.mean(bg_color)
-            if bg_brightness > 200:  # Very light
+            if bg_brightness > 200:  # Very light background
+                base_tolerance = 15
+            elif bg_brightness > 150:  # Light background  
                 base_tolerance = 18
-            elif bg_brightness > 150:  # Light
-                base_tolerance = 20
-            elif bg_brightness < 50:  # Very dark
-                base_tolerance = 18
-            else:  # Medium
+            elif bg_brightness < 50:  # Very dark background
+                base_tolerance = 15
+            else:  # Medium brightness
                 base_tolerance = 22
         else:
             base_tolerance = 20
         
+        # Try color-based removal with calculated tolerance
         result_img = remove_bg_color_method(
             img, 
             bg_color=analysis['bg_color'],
@@ -378,54 +337,55 @@ def remove_bg_smart(img_bytes):
         )
         method_used = f"color-based (tol={base_tolerance})"
         
-        # Validate content preservation
+        # Validate: check if we preserved reasonable content
         content_pixels = count_content_pixels(result_img)
         content_ratio = content_pixels / original_pixels
         
-        # Adjust if needed
-        if content_ratio < 0.05:
-            # Too aggressive
-            for tol in [15, 12, 10]:
+        # If too little content (< 3%) or too much (> 98%), adjust tolerance
+        if content_ratio < 0.03:
+            # Too aggressive - try lower tolerance
+            for tol in [12, 10, 8]:
                 alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
                 alt_content = count_content_pixels(alt_result)
                 alt_ratio = alt_content / original_pixels
-                if alt_ratio > 0.05:
+                if alt_ratio > 0.03:
                     result_img = alt_result
                     method_used = f"color-based (tol={tol}, adjusted)"
                     break
-        elif content_ratio > 0.97:
-            # Not aggressive enough
-            for tol in [25, 28, 32]:
+        elif content_ratio > 0.98:
+            # Not aggressive enough - try higher tolerance
+            for tol in [25, 30, 35]:
                 alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
                 alt_content = count_content_pixels(alt_result)
                 alt_ratio = alt_content / original_pixels
-                if alt_ratio < 0.97:
+                if alt_ratio < 0.98:
                     result_img = alt_result
                     method_used = f"color-based (tol={tol}, adjusted)"
                     break
     
     else:
-        # Try RMBG-1.4 for better quality
-        ai_result, ai_success = remove_bg_rmbg14(img_bytes)
+        # Try AI method for photos
+        ai_result, ai_success = remove_bg_ai_method(img_bytes)
         
         if ai_success and ai_result:
             result_img = ai_result
-            method_used = "AI (RMBG-1.4/u2net)"
+            method_used = "AI (isnet-general-use)"
             
-            # Validate
+            # Validate AI result
             content_pixels = count_content_pixels(result_img)
             content_ratio = content_pixels / original_pixels
             
-            # Fallback to color method if AI removed too much
+            # If AI removed too much (common with logos), fall back to color method
             if content_ratio < 0.10 and analysis['has_solid_bg']:
                 color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=20)
                 color_content = count_content_pixels(color_result)
                 
+                # Use color method if it preserved more content
                 if color_content > content_pixels * 1.3:
                     result_img = color_result
                     method_used = "color-based (AI fallback)"
         else:
-            # AI unavailable, use color method
+            # AI not available, use color method
             result_img = remove_bg_color_method(img, tolerance=20)
             method_used = "color-based (AI unavailable)"
     
@@ -435,83 +395,6 @@ def remove_bg_smart(img_bytes):
         method_used = "color-based (fallback)"
     
     return result_img, method_used, analysis
-
-
-def refine_edges_advanced(img_rgba, edge_smoothing=1, preserve_text=True):
-    """
-    Advanced edge refinement with text preservation.
-    
-    Uses bilateral filtering and selective smoothing to:
-    - Smooth jagged edges
-    - Preserve sharp text boundaries
-    - Remove artifacts around fine details
-    """
-    data = np.array(img_rgba)
-    alpha = data[:, :, 3].astype(np.float32)
-    
-    if edge_smoothing > 0:
-        if preserve_text:
-            # Use bilateral filter - preserves edges while smoothing
-            # Perfect for text and sharp graphics
-            alpha_smooth = cv2.bilateralFilter(
-                alpha.astype(np.uint8), 
-                d=5,  # Neighborhood diameter
-                sigmaColor=50,  # Color space sigma
-                sigmaSpace=50   # Coordinate space sigma
-            ).astype(np.float32)
-        else:
-            # Standard Gaussian blur
-            kernel_size = edge_smoothing * 2 + 1
-            alpha_smooth = cv2.GaussianBlur(alpha, (kernel_size, kernel_size), 0)
-        
-        # Only smooth transition zones, preserve fully opaque/transparent
-        mask = (alpha > 10) & (alpha < 245)
-        alpha[mask] = alpha_smooth[mask]
-        
-        data[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
-    
-    # Additional cleanup: remove very small isolated transparent spots
-    # (artifacts that sometimes appear in text)
-    alpha_binary = (data[:, :, 3] > 127).astype(np.uint8) * 255
-    
-    # Morphological opening to remove small noise
-    kernel = np.ones((2, 2), np.uint8)
-    cleaned = cv2.morphologyEx(alpha_binary, cv2.MORPH_OPEN, kernel)
-    
-    # Apply only where there were small artifacts
-    artifact_mask = (alpha_binary != cleaned) & (alpha_binary == 0)
-    data[:, :, 3][artifact_mask] = cleaned[artifact_mask]
-    
-    return Image.fromarray(data, 'RGBA')
-
-
-def trim_whitespace(img):
-    """
-    Trim transparent whitespace around the image.
-    """
-    data = np.array(img)
-    alpha = data[:, :, 3]
-    
-    # Find bounding box of non-transparent pixels
-    rows = np.any(alpha > 10, axis=1)
-    cols = np.any(alpha > 10, axis=0)
-    
-    if not rows.any() or not cols.any():
-        # Image is completely transparent, return as is
-        return img
-    
-    y_min, y_max = np.where(rows)[0][[0, -1]]
-    x_min, x_max = np.where(cols)[0][[0, -1]]
-    
-    # Add small padding
-    padding = 5
-    h, w = alpha.shape
-    y_min = max(0, y_min - padding)
-    y_max = min(h, y_max + padding + 1)
-    x_min = max(0, x_min - padding)
-    x_max = min(w, x_max + padding + 1)
-    
-    return img.crop((x_min, y_min, x_max, y_max))
 
 
 def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
@@ -560,17 +443,13 @@ def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
 @app.route('/remove-bg', methods=['POST'])
 def remove_bg_endpoint():
     """
-    🎯 Enhanced Professional Background Removal
+    🎯 Professional Background Removal - Automatic, remove.bg quality
     
-    NEW FEATURES:
-    - Early transparency detection (skips processing if already transparent)
-    - RMBG-1.4 model support for better quality
-    - Improved text and fine detail preservation
-    - Better edge refinement
+    Automatically analyzes the image and chooses the best removal method:
+    - Logos/graphics with solid backgrounds → Color-based removal (keeps all text/elements)
+    - Photos with complex backgrounds → AI model removal
     
-    Automatically analyzes and chooses the best removal method:
-    - Logos/graphics with solid backgrounds → Color-based (preserves all details)
-    - Complex images with text/details → RMBG-1.4 AI model
+    Just upload your image - the system handles everything automatically!
     
     Parameters:
     -----------
@@ -579,9 +458,6 @@ def remove_bg_endpoint():
     
     trim: bool (optional, default=false)
         Auto-crop to remove extra transparent space
-    
-    skip_if_transparent: bool (optional, default=true)
-        Skip processing if image already has transparency
     
     output_format: string (optional, default='png')
         Output format: 'png' or 'webp'
@@ -592,15 +468,14 @@ def remove_bg_endpoint():
     
     Headers:
     - X-Method-Used: Which removal method was used
-    - X-Already-Transparent: Whether image was already transparent
     - X-Processing-Time: Time taken in seconds
     """
+    import time
     start_time = time.time()
     
-    # Note: verify_api_key() should be called in your app.py
-    # auth_error = verify_api_key()
-    # if auth_error:
-    #     return auth_error
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
     
     try:
         # Validate input
@@ -614,7 +489,6 @@ def remove_bg_endpoint():
                     "required_field": "image",
                     "optional_fields": {
                         "trim": "true | false (auto-crop transparent space)",
-                        "skip_if_transparent": "true | false (skip if already transparent)",
                         "output_format": "png | webp"
                     },
                     "example": "curl -X POST -F 'image=@photo.jpg' http://your-api/remove-bg -o result.png"
@@ -625,40 +499,20 @@ def remove_bg_endpoint():
         
         # Read parameters
         do_trim = request.form.get('trim', 'false').lower() == 'true'
-        skip_if_transparent = request.form.get('skip_if_transparent', 'true').lower() == 'true'
         output_format = request.form.get('output_format', 'png').lower()
         
         # Read image bytes
         img_bytes = file.read()
         
-        # Load image to check transparency
-        img = Image.open(BytesIO(img_bytes))
+        # Smart background removal - automatically chooses best method
+        result_img, method_used, analysis = remove_bg_smart(img_bytes)
         
-        # NEW: Check if image already has transparency
-        already_transparent = has_transparency(img)
+        # Apply edge refinement
+        result_img = refine_edges(result_img, edge_smoothing=1)
         
-        if already_transparent and skip_if_transparent:
-            # Image is already transparent, return it immediately
-            result_img = img.convert('RGBA')
-            method_used = "skipped (already transparent)"
-            
-            # Still apply trim if requested
-            if do_trim:
-                result_img = trim_whitespace(result_img)
-        else:
-            # Process the image
-            result_img, method_used, analysis = remove_bg_smart(img_bytes)
-            
-            # Apply advanced edge refinement
-            result_img = refine_edges_advanced(
-                result_img, 
-                edge_smoothing=1,
-                preserve_text=analysis.get('has_small_text', False)
-            )
-            
-            # Trim if requested
-            if do_trim:
-                result_img = trim_whitespace(result_img)
+        # Trim whitespace if requested
+        if do_trim:
+            result_img = trim_whitespace(result_img)
         
         # Prepare output
         output = BytesIO()
@@ -686,14 +540,10 @@ def remove_bg_endpoint():
         
         # Add informative headers
         response.headers['X-Method-Used'] = method_used
-        response.headers['X-Already-Transparent'] = str(already_transparent)
+        response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
+        response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
-        
-        if not already_transparent:
-            response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
-            response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
-            response.headers['X-Has-Small-Text'] = str(analysis.get('has_small_text', False))
         
         return response
         
