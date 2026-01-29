@@ -16,7 +16,6 @@ app = Flask(__name__)
 
 # Environment variables
 API_KEY = os.environ.get('API_KEY', None)
-FAL_API_KEY = os.environ.get('FAL_API_KEY', None)  # For image enhancement
 FAL_KEY = os.environ.get('FAL_KEY', None)  # For image enhancement
 
 # FTP Configuration
@@ -701,8 +700,6 @@ def remove_bg_endpoint():
         response.headers['X-Already-Transparent'] = str(already_transparent)
 
         response.headers['X-Enhanced'] = str(enhanced)
-        response.headers['X-FAL-API-KEY'] = FAL_API_KEY
-        response.headers['X-FAL-KEY'] = FAL_KEY
         response.headers['X-Enhance-Status'] = enhance_msg
 
         response.headers['X-Trimmed'] = str(do_trim)
@@ -763,8 +760,8 @@ def enhance_image_fal(image_bytes):
     Enhance image using fal.ai SeedVR Upscale API with enhance=true
     Returns enhanced image bytes or original if API unavailable
     """
-    if not FAL_API_KEY:
-        return image_bytes, False, "FAL_API_KEY not configured"
+    if not FAL_KEY:
+        return image_bytes, False, "FAL_KEY not configured"
     
     try:
         # Convert to base64
@@ -779,7 +776,7 @@ def enhance_image_fal(image_bytes):
         response = requests.post(
             'https://queue.fal.run/fal-ai/seedvr/upscale/image',
             headers={
-                'Authorization': f'Key {FAL_API_KEY}',
+                'Authorization': f'Key {FAL_KEY}',
                 'Content-Type': 'application/json'
             },
             json={
@@ -1316,7 +1313,7 @@ def check_dependencies():
     return jsonify({
         "dependencies": deps,
         "opencv_available": 'cv2' in dir(),
-        "fal_api_configured": FAL_API_KEY is not None,
+        "fal_api_configured": FAL_KEY is not None,
         "ftp_configured": all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL])
     })
 
@@ -1754,7 +1751,7 @@ def gen_logo_variant():
     Only accepts: image (file)
     
     Pipeline:
-    1. Enhance image (fal.ai SeedVR Upscale) - if FAL_API_KEY configured
+    1. Enhance image (fal.ai SeedVR Upscale) - if FAL_KEY configured
     2. Remove background (rembg or fallback)
     3. Trim whitespace
     4. Generate color variant (auto-decided):
@@ -1787,7 +1784,7 @@ def gen_logo_variant():
         # ============================================================
         # STEP 1: Enhance image (if fal.ai configured)
         # ============================================================
-        if FAL_API_KEY:
+        if FAL_KEY:
             image_bytes, enhanced, enhance_msg = enhance_image_fal(image_bytes)
             enhance_status = "success" if enhanced else f"failed: {enhance_msg}"
         
