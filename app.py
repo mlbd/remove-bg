@@ -755,49 +755,113 @@ def remove_bg_info():
 # PROCESS-LOGO: Full Pipeline Endpoint
 # ============================================================
 
-def enhance_image_fal(image_bytes):
+def enhance_image_fal(image_bytes, wait_timeout=120, poll_interval=1.5):
     """
-    Enhance image using fal.ai SeedVR Upscale API with enhance=true
-    Returns enhanced image bytes or original if API unavailable
+    fal-ai/seedvr/upscale/image (Queue API)
+    - POST returns request_id (not final result)
+    - Poll /requests/{id}/status until COMPLETED
+    - GET /requests/{id} to fetch output schema (image.url)
+    - If sync_mode=True, image.url may be a data URI; decode it.
     """
     if not FAL_KEY:
         return image_bytes, False, "FAL_KEY not configured"
-    
+
+    import time
+
+    def _first(x):
+        return x[0] if isinstance(x, list) and x else x
+
+    def _decode_data_uri(data_uri: str) -> bytes:
+        # data:<mime>;base64,<data>
+        try:
+            head, b64 = data_uri.split(",", 1)
+            return base64.b64decode(b64)
+        except Exception:
+            return b""
+
     try:
-        # Convert to base64
-        img_base64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        # Determine mime type
+        # Convert input to base64 data URI (doc allows it)
+        img_base64 = base64.b64encode(image_bytes).decode("utf-8")
         img = Image.open(BytesIO(image_bytes))
-        mime_type = 'image/png' if img.format == 'PNG' else 'image/jpeg'
+        mime_type = "image/png" if (img.format or "").upper() == "PNG" else "image/jpeg"
         data_uri = f"data:{mime_type};base64,{img_base64}"
-        
-        # Call fal.ai API with enhance=true
-        response = requests.post(
-            'https://queue.fal.run/fal-ai/seedvr/upscale/image',
-            headers={
-                'Authorization': f'Key {FAL_KEY}',
-                'Content-Type': 'application/json'
-            },
+
+        headers = {
+            "Authorization": f"Key {FAL_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # 1) Submit (Queue)
+        submit = requests.post(
+            "https://queue.fal.run/fal-ai/seedvr/upscale/image",
+            headers=headers,
             json={
-                'image_url': data_uri,
-                'enhance': True
+                "image_url": data_uri,
+                # "sync_mode": True,  # optional; if True, output may be data URI
+                # You can add other documented fields here (upscale_mode, factor, etc.)
             },
-            timeout=120
+            timeout=60,
         )
-        
-        if response.status_code == 200:
-            result = response.json()
-            # Get the result image URL
-            if 'image' in result and 'url' in result['image']:
-                img_response = requests.get(result['image']['url'], timeout=60)
-                if img_response.status_code == 200:
-                    return img_response.content, True, "Enhanced successfully"
-        
-        return image_bytes, False, f"API returned status {response.status_code}"
-    
+
+        if submit.status_code not in (200, 201, 202):
+            return image_bytes, False, f"fal submit failed: HTTP {submit.status_code} {submit.text[:200]}"
+
+        submit_json = _first(submit.json())
+        request_id = (submit_json or {}).get("request_id")
+        if not request_id:
+            return image_bytes, False, "fal submit response missing request_id"
+
+        status_url = f"https://queue.fal.run/fal-ai/seedvr/requests/{request_id}/status"
+        result_url = f"https://queue.fal.run/fal-ai/seedvr/requests/{request_id}"
+
+        # 2) Poll status
+        start = time.monotonic()
+        while (time.monotonic() - start) < wait_timeout:
+            st = requests.get(status_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=30)
+
+            if st.status_code not in (200, 202):
+                return image_bytes, False, f"fal status failed: HTTP {st.status_code} {st.text[:200]}"
+
+            st_json = _first(st.json()) or {}
+            status = st_json.get("status")
+
+            if status in ("COMPLETED", "SUCCEEDED"):
+                break
+            if status in ("FAILED", "CANCELLED", "ERROR"):
+                return image_bytes, False, f"fal job failed: {status}"
+
+            time.sleep(poll_interval)
+        else:
+            return image_bytes, False, f"fal timeout after {wait_timeout}s"
+
+        # 3) Fetch result (Output Schema: image.url)
+        res = requests.get(result_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=30)
+        if res.status_code != 200:
+            return image_bytes, False, f"fal result failed: HTTP {res.status_code} {res.text[:200]}"
+
+        res_json = _first(res.json()) or {}
+        image_obj = res_json.get("image") or {}
+        out_url = image_obj.get("url")
+
+        if not out_url:
+            return image_bytes, False, "fal result missing image.url"
+
+        # 4) Download or decode
+        if isinstance(out_url, str) and out_url.startswith("data:"):
+            out_bytes = _decode_data_uri(out_url)
+            if out_bytes:
+                return out_bytes, True, "Enhanced successfully (fal sync_mode data URI)"
+            return image_bytes, False, "fal returned data URI but decode failed"
+
+        dl = requests.get(out_url, timeout=60)
+        if dl.status_code == 200 and dl.content:
+            return dl.content, True, "Enhanced successfully (fal queued)"
+
+        return image_bytes, False, f"fal download failed: HTTP {dl.status_code}"
+
     except Exception as e:
-        return image_bytes, False, str(e)
+        return image_bytes, False, f"fal exception: {e}"
+
 
 
 def remove_background(img):
