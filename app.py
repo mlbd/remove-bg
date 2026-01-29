@@ -508,7 +508,38 @@ def remove_bg_endpoint():
     - X-Enhanced: Whether image was enhanced/upscaled
     """
     import time
+    import json
+
     start_time = time.time()
+
+    def _now_ms():
+        return int((time.time() - start_time) * 1000)
+
+    def _hbool(v):
+        return 'true' if v else 'false'
+
+    # Step logs (kept small + header-safe)
+    step_log = []
+    step_log_json = []
+
+    def log_step(name, ok=True, detail="", extra=None):
+        # Header-safe compact log entry
+        msg = f"{name}:{'ok' if ok else 'fail'}@{_now_ms()}ms"
+        if detail:
+            # keep it header-friendly
+            d = str(detail).replace("\n", " ").replace("\r", " ")
+            if len(d) > 80:
+                d = d[:77] + "..."
+            msg += f"({d})"
+        step_log.append(msg)
+
+        # Rich JSON log (for debugging / parsing)
+        entry = {"step": name, "ok": bool(ok), "t_ms": _now_ms()}
+        if detail:
+            entry["detail"] = str(detail)
+        if extra:
+            entry["extra"] = extra
+        step_log_json.append(entry)
 
     auth_error = verify_api_key()
     if auth_error:
@@ -525,12 +556,11 @@ def remove_bg_endpoint():
                     "content_type": "multipart/form-data",
                     "required_field": "image",
                     "optional_fields": {
-                        "enhance": "true | false (upscale/enhance before bg removal, default=false)",
-                        "trim": "true | false (auto-crop transparent space, default=true)",
+                        "enhance": "true | false (default=false)",
+                        "trim": "true | false (default=true)",
                         "output_format": "png | webp",
                         "bg_remove": "auto | ai | color | skip (default=auto)"
-                    },
-                    "example": "curl -X POST -F 'image=@photo.jpg' -F 'bg_remove=ai' http://your-api/remove-bg -o result.png"
+                    }
                 }
             }), 400
 
@@ -550,92 +580,159 @@ def remove_bg_endpoint():
                 "received": bg_remove
             }), 400
 
+        log_step("params", True, extra={
+            "enhance": do_enhance,
+            "trim": do_trim,
+            "output_format": output_format,
+            "bg_remove": bg_remove
+        })
+
         # Read image bytes
         img_bytes = file.read()
+        log_step("read_image", True, detail=f"{len(img_bytes)} bytes")
 
-        # Check if image already has transparency
-        already_transparent = has_transparency(img_bytes)
+        # Check transparency
+        try:
+            already_transparent = has_transparency(img_bytes)
+            log_step("check_transparency", True, detail=f"already_transparent={already_transparent}")
+        except Exception as e:
+            already_transparent = False
+            log_step("check_transparency", False, detail=str(e))
 
-        # STEP 1: Enhance image if requested (applies to both transparent and non-transparent)
+        # STEP 1: Enhance (fal.ai)
         enhanced = False
         enhance_msg = "not requested"
         if do_enhance:
-            enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
-            if enhanced:
-                img_bytes = enhanced_bytes
+            try:
+                enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
+                if enhanced and enhanced_bytes:
+                    img_bytes = enhanced_bytes
+                    log_step("enhance_fal", True, detail="applied", extra={"msg": enhance_msg, "new_bytes": len(img_bytes)})
+                else:
+                    # enhance_image_fal returns (bytes, False, reason)
+                    log_step("enhance_fal", True, detail="skipped", extra={"msg": enhance_msg})
+            except Exception as e:
+                enhanced = False
+                enhance_msg = f"failed: {e}"
+                log_step("enhance_fal", False, detail=str(e))
+        else:
+            log_step("enhance_fal", True, detail="not requested")
 
         # STEP 2: Background removal
         analysis = {}
         fallback_used = False
+        method_used = "unknown"
 
         if bg_remove == 'skip':
-            # Skip background removal, just open the image
-            result_img = Image.open(BytesIO(img_bytes))
-            if result_img.mode != 'RGBA':
-                result_img = result_img.convert('RGBA')
-            method_used = 'skipped (bg_remove=skip)'
+            try:
+                result_img = Image.open(BytesIO(img_bytes))
+                if result_img.mode != 'RGBA':
+                    result_img = result_img.convert('RGBA')
+                method_used = 'skipped (bg_remove=skip)'
+                log_step("bg_remove", True, detail="skip")
+            except Exception as e:
+                log_step("bg_remove", False, detail=f"skip_open_failed: {e}")
+                raise
 
         elif already_transparent:
-            # Keep existing behavior: skip bg removal if already transparent
-            result_img = Image.open(BytesIO(img_bytes))
-            if result_img.mode != 'RGBA':
-                result_img = result_img.convert('RGBA')
-            method_used = 'skipped (already transparent)'
-            analysis = {}
+            try:
+                result_img = Image.open(BytesIO(img_bytes))
+                if result_img.mode != 'RGBA':
+                    result_img = result_img.convert('RGBA')
+                method_used = 'skipped (already transparent)'
+                analysis = {}
+                log_step("bg_remove", True, detail="already transparent -> skipped")
+            except Exception as e:
+                log_step("bg_remove", False, detail=f"open_failed: {e}")
+                raise
 
         else:
             if bg_remove == 'auto':
-                # Smart background removal - automatically chooses best method
-                result_img, method_used, analysis = remove_bg_smart(img_bytes)
+                try:
+                    result_img, method_used, analysis = remove_bg_smart(img_bytes)
+                    log_step("bg_remove_auto", True, detail=method_used, extra=analysis or {})
+                except Exception as e:
+                    log_step("bg_remove_auto", False, detail=str(e))
+                    raise
 
             elif bg_remove == 'ai':
-                # Force AI removal
-                ai_img, ai_ok = remove_bg_ai_method(img_bytes)
-                if ai_ok and ai_img is not None:
-                    result_img = ai_img
-                    method_used = 'AI (forced)'
-                    analysis = {"forced": "ai"}
-                else:
-                    # Fallback to auto (more robust in production)
+                try:
+                    ai_img, ai_ok = remove_bg_ai_method(img_bytes)
+                    if ai_ok and ai_img is not None:
+                        result_img = ai_img
+                        method_used = 'AI (forced)'
+                        analysis = {"forced": "ai"}
+                        log_step("bg_remove_ai", True, detail="forced ai ok")
+                    else:
+                        # fallback
+                        fallback_used = True
+                        log_step("bg_remove_ai", False, detail="ai failed -> fallback auto")
+                        result_img, method_used, analysis = remove_bg_smart(img_bytes)
+                        method_used = f"{method_used} | fallback from AI"
+                        log_step("bg_remove_auto_fallback", True, detail=method_used, extra=analysis or {})
+                except Exception as e:
+                    # if AI path explodes, still try fallback auto
                     fallback_used = True
+                    log_step("bg_remove_ai", False, detail=f"exception: {e} -> fallback auto")
                     result_img, method_used, analysis = remove_bg_smart(img_bytes)
-                    method_used = f"{method_used} | fallback from AI"
+                    method_used = f"{method_used} | fallback from AI-exception"
+                    log_step("bg_remove_auto_fallback", True, detail=method_used, extra=analysis or {})
 
             elif bg_remove == 'color':
-                # Force color-based removal
                 try:
                     img = Image.open(BytesIO(img_bytes))
                     result_img = remove_bg_color_method(img)
                     method_used = 'color-based (forced)'
                     analysis = {"forced": "color"}
-                except Exception:
-                    # Fallback to auto if something unexpected happens
+                    log_step("bg_remove_color", True, detail="forced color ok")
+                except Exception as e:
+                    # fallback
                     fallback_used = True
+                    log_step("bg_remove_color", False, detail=f"{e} -> fallback auto")
                     result_img, method_used, analysis = remove_bg_smart(img_bytes)
                     method_used = f"{method_used} | fallback from color"
+                    log_step("bg_remove_auto_fallback", True, detail=method_used, extra=analysis or {})
 
-        # STEP 3: Refine edges (applies to both - run BEFORE trim for accurate boundaries)
-        result_img = refine_edges(result_img, edge_smoothing=1)
+        # STEP 3: Refine edges
+        try:
+            result_img = refine_edges(result_img, edge_smoothing=1)
+            log_step("refine_edges", True, detail="edge_smoothing=1")
+        except Exception as e:
+            log_step("refine_edges", False, detail=str(e))
+            raise
 
-        # STEP 4: Trim whitespace if enabled (run AFTER edge refinement)
+        # STEP 4: Trim
         if do_trim:
-            result_img = trim_whitespace(result_img)
-
-        # Prepare output
-        output = BytesIO()
-
-        if output_format == 'webp':
-            result_img.save(output, format='WEBP', quality=95, lossless=False)
-            mimetype = 'image/webp'
-            extension = 'webp'
+            try:
+                before = (result_img.width, result_img.height)
+                result_img = trim_whitespace(result_img)
+                after = (result_img.width, result_img.height)
+                log_step("trim", True, detail=f"{before[0]}x{before[1]} -> {after[0]}x{after[1]}")
+            except Exception as e:
+                log_step("trim", False, detail=str(e))
+                raise
         else:
-            result_img.save(output, format='PNG', optimize=True)
-            mimetype = 'image/png'
-            extension = 'png'
+            log_step("trim", True, detail="disabled")
 
-        output.seek(0)
+        # STEP 5: Encode output
+        output = BytesIO()
+        try:
+            if output_format == 'webp':
+                result_img.save(output, format='WEBP', quality=95, lossless=False)
+                mimetype = 'image/webp'
+                extension = 'webp'
+            else:
+                result_img.save(output, format='PNG', optimize=True)
+                mimetype = 'image/png'
+                extension = 'png'
+            output.seek(0)
+            log_step("encode", True, detail=f"format={extension}, bytes={output.getbuffer().nbytes}")
+        except Exception as e:
+            log_step("encode", False, detail=str(e))
+            raise
 
         processing_time = time.time() - start_time
+        log_step("done", True, detail=f"{processing_time:.2f}s")
 
         # Return result
         response = send_file(
@@ -645,7 +742,7 @@ def remove_bg_endpoint():
             download_name=f'removed_bg.{extension}'
         )
 
-        # Add informative headers
+        # Headers (existing + improved)
         response.headers['X-Bg-Remove'] = bg_remove
         response.headers['X-Method-Used'] = method_used
         response.headers['X-Fallback-Used'] = str(fallback_used)
@@ -661,15 +758,27 @@ def remove_bg_endpoint():
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
 
+        # New: step logs
+        response.headers['X-Step-Log'] = " | ".join(step_log)
+
+        # Optional: base64 JSON log (handy for debugging; can remove if you don't want it)
+        json_b64 = base64.b64encode(json.dumps(step_log_json, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        response.headers['X-Step-Log-Json'] = json_b64
+
         return response
 
     except Exception as e:
         import traceback
+        tb = traceback.format_exc()
+
+        # best-effort include logs even on failure
         return jsonify({
             "error": "Processing failed",
             "details": str(e),
-            "traceback": traceback.format_exc()
+            "traceback": tb,
+            "step_log": step_log_json
         }), 500
+
 
 
 @app.route('/remove-bg/info', methods=['GET'])
