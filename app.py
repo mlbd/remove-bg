@@ -468,87 +468,64 @@ def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
 @app.route('/remove-bg', methods=['POST'])
 def remove_bg_endpoint():
     """
-    🎯 Professional Background Removal - Automatic, remove.bg quality
+    /remove-bg with full step logging (success + failure)
 
-    Automatically analyzes the image and chooses the best removal method:
-    - Logos/graphics with solid backgrounds → Color-based removal (keeps all text/elements)
-    - Photos with complex backgrounds → AI model removal
-
-    Parameters:
-    -----------
-    image: file (required)
-        The image to process (PNG, JPG, WebP supported)
-
-    enhance: bool (optional, default=false)
-        Upscale/enhance image using fal.ai API before background removal
-
-    trim: bool (optional, default=true)
-        Auto-crop to remove extra transparent space (set to false to disable)
-
-    output_format: string (optional, default='png')
-        Output format: 'png' or 'webp'
-
-    bg_remove: string (optional, default='auto')
-        Controls which bg removal pipeline runs:
-        - auto  : remove_bg_smart (your current behavior)
-        - ai    : force rembg AI removal (remove_bg_ai_method)
-        - color : force solid-bg/logo removal (remove_bg_color_method)
-        - skip  : skip background removal entirely
-
-    Returns:
-    --------
-    PNG/WebP image (transparent background unless bg_remove='skip')
-
-    Headers:
-    - X-Bg-Remove: Requested mode (auto|ai|color|skip)
-    - X-Method-Used: Which removal method was used
-    - X-Fallback-Used: Whether a forced method fell back to auto
-    - X-Processing-Time: Time taken in seconds
-    - X-Already-Transparent: Whether image was already transparent
-    - X-Enhanced: Whether image was enhanced/upscaled
+    Logs are returned in:
+      - Header: X-Step-Log (short human readable)
+      - Header: X-Step-Log-Json (base64 json, compact)
+      - Error JSON: includes "processing_log"
     """
     import time
     import json
+    import base64
 
     start_time = time.time()
 
-    def _now_ms():
+    # ---- logging helpers ----
+    processing_log = []  # list of dicts
+
+    def t_ms():
         return int((time.time() - start_time) * 1000)
 
-    def _hbool(v):
-        return 'true' if v else 'false'
+    def log(step, success=True, **data):
+        entry = {"step": step, "success": bool(success), "t_ms": t_ms()}
+        entry.update(data)
+        processing_log.append(entry)
 
-    # Step logs (kept small + header-safe)
-    step_log = []
-    step_log_json = []
+    def attach_logs_to_response(resp):
+        # short header-friendly summary
+        summary = []
+        for e in processing_log:
+            summary.append(f"{e['step']}:{'ok' if e.get('success') else 'fail'}@{e.get('t_ms')}ms")
+        resp.headers["X-Step-Log"] = " | ".join(summary)
 
-    def log_step(name, ok=True, detail="", extra=None):
-        # Header-safe compact log entry
-        msg = f"{name}:{'ok' if ok else 'fail'}@{_now_ms()}ms"
-        if detail:
-            # keep it header-friendly
-            d = str(detail).replace("\n", " ").replace("\r", " ")
-            if len(d) > 80:
-                d = d[:77] + "..."
-            msg += f"({d})"
-        step_log.append(msg)
+        # compact base64 json for machines
+        b = json.dumps(processing_log, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        resp.headers["X-Step-Log-Json"] = base64.b64encode(b).decode("ascii")
+        return resp
 
-        # Rich JSON log (for debugging / parsing)
-        entry = {"step": name, "ok": bool(ok), "t_ms": _now_ms()}
-        if detail:
-            entry["detail"] = str(detail)
-        if extra:
-            entry["extra"] = extra
-        step_log_json.append(entry)
+    def json_error(payload, status=400):
+        # always include logs in error json
+        payload["processing_log"] = processing_log
+        resp = jsonify(payload)
+        resp.status_code = status
+        return attach_logs_to_response(resp)
 
+    # ---- auth (log + always attach) ----
+    log("auth_check", success=True)
     auth_error = verify_api_key()
     if auth_error:
-        return auth_error
+        # verify_api_key returns (jsonify(...), 401)
+        resp, status = auth_error
+        resp.status_code = status
+        log("auth_check", success=False, reason="invalid_or_missing_api_key")
+        return attach_logs_to_response(resp)
 
     try:
-        # Validate input
+        # ---- validate input ----
         if 'image' not in request.files:
-            return jsonify({
+            log("validate_input", success=False, reason="missing_image_file")
+            return json_error({
                 "error": "No image file provided",
                 "usage": {
                     "endpoint": "/remove-bg",
@@ -562,11 +539,12 @@ def remove_bg_endpoint():
                         "bg_remove": "auto | ai | color | skip (default=auto)"
                     }
                 }
-            }), 400
+            }, status=400)
 
         file = request.files['image']
+        log("validate_input", success=True, filename=getattr(file, "filename", ""))
 
-        # Read parameters
+        # ---- read params ----
         do_enhance = request.form.get('enhance', 'false').lower() == 'true'
         do_trim = request.form.get('trim', 'true').lower() == 'true'
         output_format = request.form.get('output_format', 'png').lower()
@@ -574,109 +552,84 @@ def remove_bg_endpoint():
         bg_remove = request.form.get('bg_remove', 'auto').strip().lower()
         allowed_bg_remove = {'auto', 'ai', 'color', 'skip'}
         if bg_remove not in allowed_bg_remove:
-            return jsonify({
+            log("read_params", success=False, reason="invalid_bg_remove", received=bg_remove)
+            return json_error({
                 "error": "Invalid bg_remove value",
                 "allowed": sorted(list(allowed_bg_remove)),
                 "received": bg_remove
-            }), 400
+            }, status=400)
 
-        log_step("params", True, extra={
-            "enhance": do_enhance,
-            "trim": do_trim,
-            "output_format": output_format,
-            "bg_remove": bg_remove
-        })
+        log("read_params", success=True, enhance=do_enhance, trim=do_trim,
+            output_format=output_format, bg_remove=bg_remove)
 
-        # Read image bytes
+        # ---- read image bytes ----
         img_bytes = file.read()
-        log_step("read_image", True, detail=f"{len(img_bytes)} bytes")
+        log("read_image", success=True, bytes=len(img_bytes))
 
-        # Check transparency
+        # ---- transparency check ----
         try:
             already_transparent = has_transparency(img_bytes)
-            log_step("check_transparency", True, detail=f"already_transparent={already_transparent}")
+            log("check_transparency", success=True, already_transparent=already_transparent)
         except Exception as e:
+            # don’t kill the request; assume false and continue
             already_transparent = False
-            log_step("check_transparency", False, detail=str(e))
+            log("check_transparency", success=False, error=str(e), already_transparent=False)
 
-        # STEP 1: Enhance (fal.ai)
+        # ---- STEP 1: enhance ----
         enhanced = False
         enhance_msg = "not requested"
+
         if do_enhance:
             try:
                 enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
                 if enhanced and enhanced_bytes:
                     img_bytes = enhanced_bytes
-                    log_step("enhance_fal", True, detail="applied", extra={"msg": enhance_msg, "new_bytes": len(img_bytes)})
+                    log("enhance_fal", success=True, applied=True, message=enhance_msg, new_bytes=len(img_bytes))
                 else:
-                    # enhance_image_fal returns (bytes, False, reason)
-                    log_step("enhance_fal", True, detail="skipped", extra={"msg": enhance_msg})
+                    log("enhance_fal", success=True, applied=False, message=enhance_msg)
             except Exception as e:
                 enhanced = False
                 enhance_msg = f"failed: {e}"
-                log_step("enhance_fal", False, detail=str(e))
+                log("enhance_fal", success=False, applied=False, error=str(e))
         else:
-            log_step("enhance_fal", True, detail="not requested")
+            log("enhance_fal", success=True, applied=False, message="not requested")
 
-        # STEP 2: Background removal
+        # ---- STEP 2: background removal ----
         analysis = {}
         fallback_used = False
-        method_used = "unknown"
 
         if bg_remove == 'skip':
-            try:
-                result_img = Image.open(BytesIO(img_bytes))
-                if result_img.mode != 'RGBA':
-                    result_img = result_img.convert('RGBA')
-                method_used = 'skipped (bg_remove=skip)'
-                log_step("bg_remove", True, detail="skip")
-            except Exception as e:
-                log_step("bg_remove", False, detail=f"skip_open_failed: {e}")
-                raise
+            result_img = Image.open(BytesIO(img_bytes))
+            if result_img.mode != 'RGBA':
+                result_img = result_img.convert('RGBA')
+            method_used = 'skipped (bg_remove=skip)'
+            log("bg_remove", success=True, mode="skip", method_used=method_used)
 
         elif already_transparent:
-            try:
-                result_img = Image.open(BytesIO(img_bytes))
-                if result_img.mode != 'RGBA':
-                    result_img = result_img.convert('RGBA')
-                method_used = 'skipped (already transparent)'
-                analysis = {}
-                log_step("bg_remove", True, detail="already transparent -> skipped")
-            except Exception as e:
-                log_step("bg_remove", False, detail=f"open_failed: {e}")
-                raise
+            result_img = Image.open(BytesIO(img_bytes))
+            if result_img.mode != 'RGBA':
+                result_img = result_img.convert('RGBA')
+            method_used = 'skipped (already transparent)'
+            log("bg_remove", success=True, mode="already_transparent", method_used=method_used)
 
         else:
             if bg_remove == 'auto':
-                try:
-                    result_img, method_used, analysis = remove_bg_smart(img_bytes)
-                    log_step("bg_remove_auto", True, detail=method_used, extra=analysis or {})
-                except Exception as e:
-                    log_step("bg_remove_auto", False, detail=str(e))
-                    raise
+                result_img, method_used, analysis = remove_bg_smart(img_bytes)
+                log("bg_remove_auto", success=True, method_used=method_used, **(analysis or {}))
 
             elif bg_remove == 'ai':
-                try:
-                    ai_img, ai_ok = remove_bg_ai_method(img_bytes)
-                    if ai_ok and ai_img is not None:
-                        result_img = ai_img
-                        method_used = 'AI (forced)'
-                        analysis = {"forced": "ai"}
-                        log_step("bg_remove_ai", True, detail="forced ai ok")
-                    else:
-                        # fallback
-                        fallback_used = True
-                        log_step("bg_remove_ai", False, detail="ai failed -> fallback auto")
-                        result_img, method_used, analysis = remove_bg_smart(img_bytes)
-                        method_used = f"{method_used} | fallback from AI"
-                        log_step("bg_remove_auto_fallback", True, detail=method_used, extra=analysis or {})
-                except Exception as e:
-                    # if AI path explodes, still try fallback auto
+                ai_img, ai_ok = remove_bg_ai_method(img_bytes)
+                if ai_ok and ai_img is not None:
+                    result_img = ai_img
+                    method_used = 'AI (forced)'
+                    analysis = {"forced": "ai"}
+                    log("bg_remove_ai", success=True, method_used=method_used)
+                else:
                     fallback_used = True
-                    log_step("bg_remove_ai", False, detail=f"exception: {e} -> fallback auto")
+                    log("bg_remove_ai", success=False, reason="ai_failed_fallback_auto")
                     result_img, method_used, analysis = remove_bg_smart(img_bytes)
-                    method_used = f"{method_used} | fallback from AI-exception"
-                    log_step("bg_remove_auto_fallback", True, detail=method_used, extra=analysis or {})
+                    method_used = f"{method_used} | fallback from AI"
+                    log("bg_remove_auto_fallback", success=True, method_used=method_used, **(analysis or {}))
 
             elif bg_remove == 'color':
                 try:
@@ -684,57 +637,52 @@ def remove_bg_endpoint():
                     result_img = remove_bg_color_method(img)
                     method_used = 'color-based (forced)'
                     analysis = {"forced": "color"}
-                    log_step("bg_remove_color", True, detail="forced color ok")
+                    log("bg_remove_color", success=True, method_used=method_used)
                 except Exception as e:
-                    # fallback
                     fallback_used = True
-                    log_step("bg_remove_color", False, detail=f"{e} -> fallback auto")
+                    log("bg_remove_color", success=False, error=str(e), reason="fallback_auto")
                     result_img, method_used, analysis = remove_bg_smart(img_bytes)
                     method_used = f"{method_used} | fallback from color"
-                    log_step("bg_remove_auto_fallback", True, detail=method_used, extra=analysis or {})
+                    log("bg_remove_auto_fallback", success=True, method_used=method_used, **(analysis or {}))
 
-        # STEP 3: Refine edges
+        # ---- STEP 3: refine edges ----
         try:
             result_img = refine_edges(result_img, edge_smoothing=1)
-            log_step("refine_edges", True, detail="edge_smoothing=1")
+            log("refine_edges", success=True, edge_smoothing=1)
         except Exception as e:
-            log_step("refine_edges", False, detail=str(e))
+            log("refine_edges", success=False, error=str(e))
             raise
 
-        # STEP 4: Trim
+        # ---- STEP 4: trim ----
         if do_trim:
             try:
-                before = (result_img.width, result_img.height)
+                before = f"{result_img.width}x{result_img.height}"
                 result_img = trim_whitespace(result_img)
-                after = (result_img.width, result_img.height)
-                log_step("trim", True, detail=f"{before[0]}x{before[1]} -> {after[0]}x{after[1]}")
+                after = f"{result_img.width}x{result_img.height}"
+                log("trim", success=True, before=before, after=after)
             except Exception as e:
-                log_step("trim", False, detail=str(e))
+                log("trim", success=False, error=str(e))
                 raise
         else:
-            log_step("trim", True, detail="disabled")
+            log("trim", success=True, skipped=True)
 
-        # STEP 5: Encode output
+        # ---- encode output ----
         output = BytesIO()
-        try:
-            if output_format == 'webp':
-                result_img.save(output, format='WEBP', quality=95, lossless=False)
-                mimetype = 'image/webp'
-                extension = 'webp'
-            else:
-                result_img.save(output, format='PNG', optimize=True)
-                mimetype = 'image/png'
-                extension = 'png'
-            output.seek(0)
-            log_step("encode", True, detail=f"format={extension}, bytes={output.getbuffer().nbytes}")
-        except Exception as e:
-            log_step("encode", False, detail=str(e))
-            raise
+        if output_format == 'webp':
+            result_img.save(output, format='WEBP', quality=95, lossless=False)
+            mimetype = 'image/webp'
+            extension = 'webp'
+        else:
+            result_img.save(output, format='PNG', optimize=True)
+            mimetype = 'image/png'
+            extension = 'png'
+        output.seek(0)
+        log("encode", success=True, format=extension, out_bytes=output.getbuffer().nbytes)
 
         processing_time = time.time() - start_time
-        log_step("done", True, detail=f"{processing_time:.2f}s")
+        log("done", success=True, processing_time_s=f"{processing_time:.2f}")
 
-        # Return result
+        # ---- send response ----
         response = send_file(
             output,
             mimetype=mimetype,
@@ -742,7 +690,7 @@ def remove_bg_endpoint():
             download_name=f'removed_bg.{extension}'
         )
 
-        # Headers (existing + improved)
+        # Existing informative headers
         response.headers['X-Bg-Remove'] = bg_remove
         response.headers['X-Method-Used'] = method_used
         response.headers['X-Fallback-Used'] = str(fallback_used)
@@ -758,26 +706,20 @@ def remove_bg_endpoint():
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
 
-        # New: step logs
-        response.headers['X-Step-Log'] = " | ".join(step_log)
-
-        # Optional: base64 JSON log (handy for debugging; can remove if you don't want it)
-        json_b64 = base64.b64encode(json.dumps(step_log_json, ensure_ascii=False).encode("utf-8")).decode("ascii")
-        response.headers['X-Step-Log-Json'] = json_b64
-
-        return response
+        # Always attach logs for success too
+        return attach_logs_to_response(response)
 
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
+        log("exception", success=False, error=str(e))
 
-        # best-effort include logs even on failure
-        return jsonify({
+        return json_error({
             "error": "Processing failed",
             "details": str(e),
-            "traceback": tb,
-            "step_log": step_log_json
-        }), 500
+            "traceback": tb
+        }, status=500)
+
 
 
 
