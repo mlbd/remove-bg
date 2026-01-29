@@ -700,6 +700,8 @@ def remove_bg_endpoint():
         response.headers['X-Already-Transparent'] = str(already_transparent)
 
         response.headers['X-Enhanced'] = str(enhanced)
+        response.headers['X-Fal-Key'] = FAL_API_KEY
+        response.headers['X-Fal-Key-Present'] = 'true' if bool(os.getenv("FAL_KEY")) else 'false'
         response.headers['X-Enhance-Status'] = enhance_msg
 
         response.headers['X-Trimmed'] = str(do_trim)
