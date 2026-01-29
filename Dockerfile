@@ -18,9 +18,9 @@ RUN mkdir -p /app/.u2net
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the isnet-general-use model (recommended for remove.bg quality)
+# Pre-download the u2net model (RMBG-1.4 - better quality for text and fine details)
 # This prevents download on first request and speeds up cold starts
-RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
+RUN python -c "from rembg import new_session; new_session('u2net')"
 
 COPY app.py .
 
