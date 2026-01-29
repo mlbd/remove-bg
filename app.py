@@ -984,6 +984,37 @@ def upload_images_to_ftp(images_dict, folder_id: str):
         return None, str(e)
 
 
+def get_folder_id_from_request():
+    """
+    Accept folder_id from:
+      1) multipart/form-data: folder_id
+      2) query param: ?folder_id=
+      3) header: X-Folder-Id
+    Falls back to uuid4 if missing.
+
+    Sanitizes to FTP-safe: a-z A-Z 0-9 _ -
+    """
+    raw = (
+        (request.form.get("folder_id") if request.form else None)
+        or request.args.get("folder_id")
+        or request.headers.get("X-Folder-Id")
+        or ""
+    ).strip()
+
+    if not raw:
+        return str(uuid.uuid4())
+
+    # Replace spaces with dashes and remove unsafe chars
+    safe = raw.replace(" ", "-")
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", safe)
+
+    # Avoid empty / weird edge cases after sanitize
+    if not safe:
+        return str(uuid.uuid4())
+
+    # Optional: cap length for sanity
+    return safe[:80]
+
 @app.route('/process-logo', methods=['POST'])
 def process_logo():
     """
@@ -1031,8 +1062,8 @@ def process_logo():
         # Read image bytes
         image_bytes = file.read()
         
-        # Generate unique folder ID
-        folder_id = str(uuid.uuid4())
+        # ✅ folder_id from request (instead of always generating uuid)
+        folder_id = get_folder_id_from_request()
         
         # Track processing steps
         processing_log = []
