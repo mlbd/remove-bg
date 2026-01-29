@@ -6,3 +6,4 @@ Werkzeug==3.0.3
 opencv-python-headless==4.10.0.84
 requests==2.31.0
 rembg==2.0.50
+onnxruntime==1.23.2
