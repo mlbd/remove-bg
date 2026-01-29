@@ -397,6 +397,31 @@ def remove_bg_smart(img_bytes):
     return result_img, method_used, analysis
 
 
+def has_transparency(img_bytes):
+    """
+    Check if image already has transparency (alpha channel with non-255 values)
+    Returns: True if image has transparency, False otherwise
+    """
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        
+        # If image doesn't have alpha channel, it's not transparent
+        if img.mode not in ('RGBA', 'LA', 'PA'):
+            return False
+        
+        # Convert to RGBA to standardize
+        img_rgba = img.convert('RGBA')
+        data = np.array(img_rgba)
+        alpha = data[:, :, 3]
+        
+        # Check if any pixel has alpha < 255 (partially or fully transparent)
+        has_transparent_pixels = np.any(alpha < 255)
+        
+        return has_transparent_pixels
+    except Exception:
+        return False
+
+
 def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
     """
     Post-process to refine edges and reduce jaggedness
@@ -456,8 +481,11 @@ def remove_bg_endpoint():
     image: file (required)
         The image to process (PNG, JPG, WebP supported)
     
-    trim: bool (optional, default=false)
-        Auto-crop to remove extra transparent space
+    enhance: bool (optional, default=false)
+        Upscale/enhance image using fal.ai API before background removal
+    
+    trim: bool (optional, default=true)
+        Auto-crop to remove extra transparent space (set to false to disable)
     
     output_format: string (optional, default='png')
         Output format: 'png' or 'webp'
@@ -469,6 +497,8 @@ def remove_bg_endpoint():
     Headers:
     - X-Method-Used: Which removal method was used
     - X-Processing-Time: Time taken in seconds
+    - X-Already-Transparent: Whether image was already transparent
+    - X-Enhanced: Whether image was enhanced/upscaled
     """
     import time
     start_time = time.time()
@@ -488,29 +518,84 @@ def remove_bg_endpoint():
                     "content_type": "multipart/form-data",
                     "required_field": "image",
                     "optional_fields": {
-                        "trim": "true | false (auto-crop transparent space)",
+                        "enhance": "true | false (upscale/enhance before bg removal, default=false)",
+                        "trim": "true | false (auto-crop transparent space, default=true)",
                         "output_format": "png | webp"
                     },
-                    "example": "curl -X POST -F 'image=@photo.jpg' http://your-api/remove-bg -o result.png"
+                    "example": "curl -X POST -F 'image=@photo.jpg' -F 'enhance=true' http://your-api/remove-bg -o result.png"
                 }
             }), 400
         
         file = request.files['image']
         
         # Read parameters
-        do_trim = request.form.get('trim', 'false').lower() == 'true'
+        do_enhance = request.form.get('enhance', 'false').lower() == 'true'
+        do_trim = request.form.get('trim', 'true').lower() == 'true'
         output_format = request.form.get('output_format', 'png').lower()
         
         # Read image bytes
         img_bytes = file.read()
         
-        # Smart background removal - automatically chooses best method
+        # STEP 1: Check if image is already transparent
+        if has_transparency(img_bytes):
+            # Image already has transparency, return original
+            img = Image.open(BytesIO(img_bytes))
+            
+            # Trim whitespace if enabled (default=true)
+            if do_trim:
+                result_img = trim_whitespace(img)
+            else:
+                result_img = img
+            
+            # Prepare output
+            output = BytesIO()
+            
+            if output_format == 'webp':
+                result_img.save(output, format='WEBP', quality=95, lossless=False)
+                mimetype = 'image/webp'
+                extension = 'webp'
+            else:
+                result_img.save(output, format='PNG', optimize=True)
+                mimetype = 'image/png'
+                extension = 'png'
+            
+            output.seek(0)
+            processing_time = time.time() - start_time
+            
+            response = send_file(
+                output,
+                mimetype=mimetype,
+                as_attachment=True,
+                download_name=f'removed_bg.{extension}'
+            )
+            
+            response.headers['X-Method-Used'] = 'original (already transparent)'
+            response.headers['X-Already-Transparent'] = 'true'
+            response.headers['X-Enhanced'] = 'false'
+            response.headers['X-Trimmed'] = str(do_trim)
+            response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
+            response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
+            
+            return response
+        
+        # STEP 2: Upscale/enhance the image using fal.ai API (only if enhance=true)
+        enhanced = False
+        enhance_msg = "not requested"
+        
+        if do_enhance:
+            enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
+            
+            # Use enhanced version if upscaling succeeded
+            if enhanced:
+                img_bytes = enhanced_bytes
+        
+        # STEP 3: Smart background removal - automatically chooses best method
         result_img, method_used, analysis = remove_bg_smart(img_bytes)
         
         # Apply edge refinement
         result_img = refine_edges(result_img, edge_smoothing=1)
         
-        # Trim whitespace if requested
+        # STEP 4: Trim whitespace if enabled (default=true)
         if do_trim:
             result_img = trim_whitespace(result_img)
         
@@ -542,6 +627,10 @@ def remove_bg_endpoint():
         response.headers['X-Method-Used'] = method_used
         response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
         response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
+        response.headers['X-Already-Transparent'] = 'false'
+        response.headers['X-Enhanced'] = str(enhanced)
+        response.headers['X-Enhance-Status'] = enhance_msg
+        response.headers['X-Trimmed'] = str(do_trim)
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
         
@@ -590,7 +679,7 @@ def remove_bg_info():
 
 def enhance_image_fal(image_bytes):
     """
-    Enhance image using fal.ai SeedVR Upscale API
+    Enhance image using fal.ai SeedVR Upscale API with enhance=true
     Returns enhanced image bytes or original if API unavailable
     """
     if not FAL_API_KEY:
@@ -605,7 +694,7 @@ def enhance_image_fal(image_bytes):
         mime_type = 'image/png' if img.format == 'PNG' else 'image/jpeg'
         data_uri = f"data:{mime_type};base64,{img_base64}"
         
-        # Call fal.ai API
+        # Call fal.ai API with enhance=true
         response = requests.post(
             'https://queue.fal.run/fal-ai/seedvr/upscale/image',
             headers={
@@ -614,7 +703,7 @@ def enhance_image_fal(image_bytes):
             },
             json={
                 'image_url': data_uri,
-                'upscale_factor': 2
+                'enhance': True
             },
             timeout=120
         )
