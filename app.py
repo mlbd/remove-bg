@@ -4,27 +4,18 @@ import numpy as np
 from io import BytesIO
 import os
 import cv2
-import base64
-import requests
-import zipfile
-import tempfile
-import ftplib
-import uuid
-from datetime import datetime
+
+# Optional: background removal (install: rembg + onnxruntime)
+try:
+    from rembg import remove, new_session
+except Exception:
+    remove = None
+    new_session = None
 
 app = Flask(__name__)
 
 # Environment variables
 API_KEY = os.environ.get('API_KEY', None)
-FAL_API_KEY = os.environ.get('FAL_API_KEY', None)  # For image enhancement
-
-# FTP Configuration
-FTP_HOST = os.environ.get('FTP_HOST', None)
-FTP_USER = os.environ.get('FTP_USER', None)
-FTP_PASS = os.environ.get('FTP_PASS', None)
-FTP_DIR = os.environ.get('FTP_DIR', '/logos')  # Remote directory to upload to
-FTP_BASE_URL = os.environ.get('FTP_BASE_URL', None)  # Public URL base (e.g., https://cdn.example.com/logos)
-
 MAX_FILE_SIZE = int(os.environ.get('MAX_FILE_SIZE_MB', 10)) * 1024 * 1024
 DEFAULT_THRESHOLD = int(os.environ.get('DEFAULT_THRESHOLD', 100))
 DEBUG = os.environ.get('FLASK_DEBUG', 'False').lower() == 'true'
@@ -51,595 +42,21 @@ def home():
         "authentication": "required" if API_KEY else "not required",
         "endpoints": {
             "/health": "GET - Health check",
-            "/process-logo": "POST - 🚀 FULL PIPELINE: enhance → remove bg → trim → generate all variants",
-            "/gen-logo-variant": "POST - 🎯 Generate color variant (with enhance, bg removal, trim)",
-            "/logo-type": "POST - 🔍 Detect logo type (returns 'black' or 'white')",
-            "/smart-print-ready": "POST - SMART print-ready conversion",
+            "/smart-print-ready": "POST - 🎯 SMART print-ready conversion (RECOMMENDED)",
             "/smart-print-ready/analyze": "POST - Analyze logo before processing",
-            "/smart-logo-variant": "POST - Generate logo variant (outline fallback)",
             "/force-solid-black": "POST - Force entire logo to solid black",
             "/force-solid-white": "POST - Force entire logo to solid white",
             "/replace-dark-to-white": "POST - Replace dark colors with white",
             "/replace-light-to-dark": "POST - Replace light colors with dark",
             "/invert-colors": "POST - Invert all colors",
-            "/check-transparency": "POST - Check image transparency"
+            "/check-transparency": "POST - Check image transparency",
+            "/remove-bg": "POST - Remove background (transparent PNG)"
         }
     })
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "healthy", "message": "Service is running"})
-
-
-# ============================================================
-# PROCESS-LOGO: Full Pipeline Endpoint
-# ============================================================
-
-def enhance_image_fal(image_bytes):
-    """
-    Enhance image using fal.ai SeedVR Upscale API
-    Returns enhanced image bytes or original if API unavailable
-    """
-    if not FAL_API_KEY:
-        return image_bytes, False, "FAL_API_KEY not configured"
-    
-    try:
-        # Convert to base64
-        img_base64 = base64.b64encode(image_bytes).decode('utf-8')
-        
-        # Determine mime type
-        img = Image.open(BytesIO(image_bytes))
-        mime_type = 'image/png' if img.format == 'PNG' else 'image/jpeg'
-        data_uri = f"data:{mime_type};base64,{img_base64}"
-        
-        # Call fal.ai API
-        response = requests.post(
-            'https://queue.fal.run/fal-ai/seedvr/upscale/image',
-            headers={
-                'Authorization': f'Key {FAL_API_KEY}',
-                'Content-Type': 'application/json'
-            },
-            json={
-                'image_url': data_uri,
-                'upscale_factor': 2
-            },
-            timeout=120
-        )
-        
-        if response.status_code == 200:
-            result = response.json()
-            # Get the result image URL
-            if 'image' in result and 'url' in result['image']:
-                img_response = requests.get(result['image']['url'], timeout=60)
-                if img_response.status_code == 200:
-                    return img_response.content, True, "Enhanced successfully"
-        
-        return image_bytes, False, f"API returned status {response.status_code}"
-    
-    except Exception as e:
-        return image_bytes, False, str(e)
-
-
-def remove_background(img):
-    """
-    Remove background from image using rembg if available,
-    otherwise use simple threshold-based removal
-    Returns RGBA image with transparent background
-    """
-    try:
-        from rembg import remove
-        # rembg is available, use it
-        output = remove(img)
-        return output, "rembg"
-    except ImportError:
-        pass
-    
-    # Fallback: Simple background removal using corner color detection
-    img_rgba = img.convert('RGBA')
-    data = np.array(img_rgba)
-    h, w = data.shape[:2]
-    
-    r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
-    
-    # Detect background from corners
-    corners = [data[0, 0], data[0, w-1], data[h-1, 0], data[h-1, w-1]]
-    corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
-    corner_std = float(np.std(corner_rgb))
-    
-    if corner_std < 30:  # Corners are consistent (likely solid background)
-        avg_corner = np.mean(corner_rgb, axis=0).astype(np.uint8)
-        tolerance = 25
-        
-        # Create mask for background pixels
-        bg_mask = (
-            (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
-            (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
-            (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance)
-        )
-        
-        # Flood fill from corners to get connected background
-        bg_u8 = (bg_mask.astype(np.uint8) * 255)
-        connected_bg = np.zeros_like(bg_u8)
-        
-        for sy, sx in [(0, 0), (0, w-1), (h-1, 0), (h-1, w-1)]:
-            if bg_u8[sy, sx] > 0:
-                temp = bg_u8.copy()
-                flood = np.zeros((h + 2, w + 2), np.uint8)
-                cv2.floodFill(temp, flood, (sx, sy), 128)
-                connected_bg[temp == 128] = 255
-        
-        # Set background pixels to transparent
-        data[connected_bg > 0, 3] = 0
-        
-        return Image.fromarray(data, 'RGBA'), "corner_detection"
-    
-    return img_rgba, "none"
-
-
-def trim_whitespace(img):
-    """
-    Remove transparent/whitespace areas around the logo
-    Returns cropped image
-    """
-    img_rgba = img.convert('RGBA')
-    data = np.array(img_rgba)
-    
-    # Find non-transparent pixels
-    alpha = data[:, :, 3]
-    non_transparent = np.where(alpha > 10)
-    
-    if len(non_transparent[0]) == 0:
-        return img_rgba  # No visible pixels, return as-is
-    
-    # Get bounding box
-    y_min, y_max = non_transparent[0].min(), non_transparent[0].max()
-    x_min, x_max = non_transparent[1].min(), non_transparent[1].max()
-    
-    # Add small padding (2px)
-    padding = 2
-    y_min = max(0, y_min - padding)
-    y_max = min(data.shape[0], y_max + padding + 1)
-    x_min = max(0, x_min - padding)
-    x_max = min(data.shape[1], x_max + padding + 1)
-    
-    # Crop
-    cropped = data[y_min:y_max, x_min:x_max]
-    
-    return Image.fromarray(cropped, 'RGBA')
-
-
-def determine_logo_type(img):
-    """
-    Analyze logo to determine if it's black-ish or white-ish
-    Returns: "black" or "white"
-    """
-    img_rgba = img.convert('RGBA')
-    data = np.array(img_rgba)
-    
-    r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
-    
-    # Only consider visible pixels (alpha > 10)
-    visible_mask = a > 10
-    
-    if not np.any(visible_mask):
-        return "black", 0.0, 0.0  # Default to black if no visible pixels
-    
-    # Calculate luminance for visible pixels
-    luminance = (0.299 * r + 0.587 * g + 0.114 * b)
-    visible_lum = luminance[visible_mask]
-    
-    # Define thresholds
-    dark_threshold = 100
-    light_threshold = 200
-    
-    # Count dark and light pixels
-    dark_pixels = np.sum(visible_lum < dark_threshold)
-    light_pixels = np.sum(visible_lum > light_threshold)
-    total_visible = visible_mask.sum()
-    
-    dark_ratio = dark_pixels / total_visible if total_visible > 0 else 0
-    light_ratio = light_pixels / total_visible if total_visible > 0 else 0
-    
-    # Determine type based on ratios
-    if dark_ratio > light_ratio:
-        return "black", dark_ratio, light_ratio
-    elif light_ratio > dark_ratio:
-        return "white", dark_ratio, light_ratio
-    else:
-        # If equal or both low, check average luminance
-        avg_lum = np.mean(visible_lum)
-        if avg_lum < 128:
-            return "black", dark_ratio, light_ratio
-        else:
-            return "white", dark_ratio, light_ratio
-
-
-def generate_solid_version(img, color):
-    """
-    Generate solid black or white version of logo
-    color: "black" or "white"
-    """
-    img_rgba = img.convert('RGBA')
-    data = np.array(img_rgba)
-    
-    # Only modify visible pixels (alpha > 10)
-    visible_mask = data[:, :, 3] > 10
-    
-    if color == "black":
-        data[visible_mask, 0] = 0
-        data[visible_mask, 1] = 0
-        data[visible_mask, 2] = 0
-    else:  # white
-        data[visible_mask, 0] = 255
-        data[visible_mask, 1] = 255
-        data[visible_mask, 2] = 255
-    
-    return Image.fromarray(data, 'RGBA')
-
-
-def generate_variant(img, current_type):
-    """
-    Generate color variant (opposite of current type)
-    Uses the same logic as /gen-logo-variant but inline
-    """
-    img_rgba = img.convert('RGBA')
-    data = np.array(img_rgba)
-    h, w = data.shape[:2]
-    
-    r = data[:, :, 0].astype(np.uint8)
-    g = data[:, :, 1].astype(np.uint8)
-    b = data[:, :, 2].astype(np.uint8)
-    a = data[:, :, 3].astype(np.uint8)
-    
-    # Logo mask (visible pixels)
-    alpha_min = 10
-    logo_mask = a > alpha_min
-    
-    if not np.any(logo_mask):
-        return img_rgba
-    
-    # Thresholds
-    dark_thr = 100
-    white_cut = 220
-    
-    # Detect dark and white pixels in logo
-    blackish = logo_mask & (r < dark_thr) & (g < dark_thr) & (b < dark_thr)
-    whiteish = logo_mask & (r > white_cut) & (g > white_cut) & (b > white_cut)
-    
-    dark_px = int(np.sum(blackish))
-    white_px = int(np.sum(whiteish))
-    logo_px = int(np.sum(logo_mask))
-    
-    dark_ratio = dark_px / max(1, logo_px)
-    white_ratio = white_px / max(1, logo_px)
-    
-    changed = False
-    
-    # Apply transformation based on detected type
-    if current_type == "black" and dark_ratio > 0.1:
-        # Convert dark to white
-        data[blackish, 0] = 255
-        data[blackish, 1] = 255
-        data[blackish, 2] = 255
-        changed = True
-    elif current_type == "white" and white_ratio > 0.1:
-        # Convert white to black
-        data[whiteish, 0] = 0
-        data[whiteish, 1] = 0
-        data[whiteish, 2] = 0
-        changed = True
-    
-    # If no significant change, invert logo colors
-    if not changed:
-        data[logo_mask, 0] = 255 - data[logo_mask, 0]
-        data[logo_mask, 1] = 255 - data[logo_mask, 1]
-        data[logo_mask, 2] = 255 - data[logo_mask, 2]
-    
-    return Image.fromarray(data, 'RGBA')
-
-
-def image_to_base64(img):
-    """Convert PIL Image to base64 string"""
-    buffer = BytesIO()
-    img.save(buffer, format='PNG', optimize=True)
-    buffer.seek(0)
-    return base64.b64encode(buffer.getvalue()).decode('utf-8')
-
-
-def upload_images_to_ftp(images_dict, folder_id):
-    """
-    Upload multiple images to FTP in a unique folder
-    
-    Args:
-        images_dict: dict of {filename: PIL_Image}
-        folder_id: unique folder name to create
-    
-    Returns:
-        dict of {filename: url} and status message
-    """
-    if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL]):
-        return None, "FTP not configured (set FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL)"
-    
-    urls = {}
-    
-    try:
-        # Connect to FTP
-        ftp = ftplib.FTP(FTP_HOST)
-        ftp.login(FTP_USER, FTP_PASS)
-        
-        # Navigate to base directory
-        if FTP_DIR:
-            try:
-                ftp.cwd(FTP_DIR)
-            except ftplib.error_perm:
-                # Try to create base directory
-                ftp.mkd(FTP_DIR)
-                ftp.cwd(FTP_DIR)
-        
-        # Create unique folder for this batch
-        try:
-            ftp.mkd(folder_id)
-        except ftplib.error_perm:
-            pass  # Folder might already exist
-        
-        ftp.cwd(folder_id)
-        
-        # Upload each image
-        for filename, pil_img in images_dict.items():
-            img_buffer = BytesIO()
-            pil_img.save(img_buffer, format='PNG', optimize=True)
-            img_buffer.seek(0)
-            
-            ftp.storbinary(f'STOR {filename}', img_buffer)
-            
-            # Build public URL
-            # FTP_BASE_URL should be the full public base URL including any subdirectories
-            # e.g., https://lukpaluk.xyz/smart-logo-versions/uploads
-            # We only append folder_id and filename (FTP_DIR is for FTP navigation only)
-            base_url = FTP_BASE_URL.rstrip('/')
-            urls[filename] = f"{base_url}/{folder_id}/{filename}"
-        
-        ftp.quit()
-        return urls, "success"
-    
-    except Exception as e:
-        return None, str(e)
-
-
-@app.route('/process-logo', methods=['POST'])
-def process_logo():
-    """
-    FULL LOGO PROCESSING PIPELINE (v2) - With FTP Upload
-    
-    Accepts: image (file) - required
-    Optional params:
-        - enhance: 'true'/'false' (default: 'true') - Use fal.ai enhancement
-        - remove_bg: 'true'/'false' (default: 'true') - Remove background
-        - trim: 'true'/'false' (default: 'true') - Trim whitespace
-    
-    Pipeline:
-    1. Enhance image (fal.ai SeedVR Upscale)
-    2. Remove background (rembg or fallback)
-    3. Trim whitespace
-    4. Determine logo type (black-ish or white-ish)
-    5. Generate 4 versions:
-       - original_{type}: The processed original
-       - original_{opposite}: Color variant (inverted)
-       - bw_black: Solid black version
-       - bw_white: Solid white version
-    6. Create unique folder and upload all 4 to FTP
-    
-    Returns: JSON with folder_id and image URLs
-    
-    Required Environment Variables for FTP:
-        - FTP_HOST: FTP server hostname
-        - FTP_USER: FTP username
-        - FTP_PASS: FTP password
-        - FTP_DIR: Base remote directory (default: /logos)
-        - FTP_BASE_URL: Public URL base (e.g., https://cdn.example.com)
-    """
-    
-    auth_error = verify_api_key()
-    if auth_error:
-        return auth_error
-    
-    try:
-        if 'image' not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-        
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({"error": "Empty filename"}), 400
-        
-        # Check FTP configuration
-        if not all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL]):
-            return jsonify({
-                "error": "FTP not configured",
-                "message": "Please set FTP_HOST, FTP_USER, FTP_PASS, and FTP_BASE_URL environment variables"
-            }), 500
-        
-        # Parse options
-        do_enhance = request.form.get('enhance', 'true').lower() == 'true'
-        do_remove_bg = request.form.get('remove_bg', 'true').lower() == 'true'
-        do_trim = request.form.get('trim', 'true').lower() == 'true'
-        
-        # Read image bytes
-        image_bytes = file.read()
-        
-        # Generate unique folder ID
-        folder_id = str(uuid.uuid4())
-        
-        # Track processing steps
-        processing_log = []
-        
-        # ============================================================
-        # STEP 1: Enhance image (optional)
-        # ============================================================
-        if do_enhance:
-            image_bytes, enhanced, enhance_msg = enhance_image_fal(image_bytes)
-            processing_log.append({
-                "step": "enhance",
-                "success": enhanced,
-                "message": enhance_msg
-            })
-        else:
-            processing_log.append({
-                "step": "enhance",
-                "success": False,
-                "message": "Skipped (disabled)"
-            })
-        
-        # Load as PIL Image
-        img = Image.open(BytesIO(image_bytes))
-        
-        # ============================================================
-        # STEP 2: Remove background (optional)
-        # ============================================================
-        if do_remove_bg:
-            # Check if already has transparency
-            has_transparency = False
-            if img.mode == 'RGBA':
-                alpha = np.array(img)[:, :, 3]
-                has_transparency = np.any(alpha < 255)
-            
-            if has_transparency:
-                img = img.convert('RGBA')
-                bg_method = "already_transparent"
-            else:
-                img, bg_method = remove_background(img)
-            
-            processing_log.append({
-                "step": "remove_background",
-                "success": True,
-                "method": bg_method
-            })
-        else:
-            img = img.convert('RGBA')
-            processing_log.append({
-                "step": "remove_background",
-                "success": False,
-                "message": "Skipped (disabled)"
-            })
-        
-        # ============================================================
-        # STEP 3: Trim whitespace (optional)
-        # ============================================================
-        if do_trim:
-            original_size = img.size
-            img = trim_whitespace(img)
-            new_size = img.size
-            processing_log.append({
-                "step": "trim",
-                "success": True,
-                "original_size": f"{original_size[0]}x{original_size[1]}",
-                "new_size": f"{new_size[0]}x{new_size[1]}"
-            })
-        else:
-            processing_log.append({
-                "step": "trim",
-                "success": False,
-                "message": "Skipped (disabled)"
-            })
-        
-        # ============================================================
-        # STEP 4: Determine logo type
-        # ============================================================
-        logo_type, dark_ratio, light_ratio = determine_logo_type(img)
-        opposite_type = "white" if logo_type == "black" else "black"
-        
-        processing_log.append({
-            "step": "analyze",
-            "detected_type": logo_type,
-            "dark_ratio": f"{dark_ratio:.4f}",
-            "light_ratio": f"{light_ratio:.4f}"
-        })
-        
-        # ============================================================
-        # STEP 5: Generate all 4 versions
-        # ============================================================
-        
-        # Original (processed)
-        original_key = f"original_{logo_type}"
-        original_img = img.copy()
-        
-        # Variant (opposite color)
-        variant_key = f"original_{opposite_type}"
-        variant_img = generate_variant(img, logo_type)
-        
-        # Solid black
-        bw_black_img = generate_solid_version(img, "black")
-        
-        # Solid white
-        bw_white_img = generate_solid_version(img, "white")
-        
-        processing_log.append({
-            "step": "generate_versions",
-            "success": True,
-            "versions": [original_key, variant_key, "bw_black", "bw_white"]
-        })
-        
-        # ============================================================
-        # STEP 6: Upload to FTP
-        # ============================================================
-        images_to_upload = {
-            f"{original_key}.png": original_img,
-            f"{variant_key}.png": variant_img,
-            "bw_black.png": bw_black_img,
-            "bw_white.png": bw_white_img
-        }
-        
-        urls, ftp_status = upload_images_to_ftp(images_to_upload, folder_id)
-        
-        if urls is None:
-            return jsonify({
-                "error": "FTP upload failed",
-                "message": ftp_status,
-                "processing_log": processing_log
-            }), 500
-        
-        processing_log.append({
-            "step": "ftp_upload",
-            "success": True,
-            "folder_id": folder_id,
-            "files_uploaded": len(urls)
-        })
-        
-        # ============================================================
-        # OUTPUT: JSON with URLs
-        # ============================================================
-        return jsonify({
-            "success": True,
-            "folder_id": folder_id,
-            "detected_type": logo_type,
-            "processing_log": processing_log,
-            "images": {
-                original_key: {
-                    "description": f"Original processed logo ({logo_type})",
-                    "url": urls[f"{original_key}.png"]
-                },
-                variant_key: {
-                    "description": f"Color variant ({opposite_type})",
-                    "url": urls[f"{variant_key}.png"]
-                },
-                "bw_black": {
-                    "description": "Solid black version",
-                    "url": urls["bw_black.png"]
-                },
-                "bw_white": {
-                    "description": "Solid white version",
-                    "url": urls["bw_white.png"]
-                }
-            }
-        })
-    
-    except Exception as e:
-        import traceback
-        return jsonify({
-            "error": "Processing failed",
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
-
 
 @app.route('/check-dependencies', methods=['GET'])
 def check_dependencies():
@@ -671,16 +88,20 @@ def check_dependencies():
         deps['opencv'] = f'NOT INSTALLED: {str(e)}'
     
     try:
-        from rembg import remove
-        deps['rembg'] = 'INSTALLED'
-    except ImportError:
-        deps['rembg'] = 'NOT INSTALLED (will use fallback bg removal)'
-    
+        import rembg
+        deps['rembg'] = getattr(rembg, '__version__', 'installed')
+    except Exception as e:
+        deps['rembg'] = f'NOT INSTALLED: {str(e)}'
+
+    try:
+        import onnxruntime
+        deps['onnxruntime'] = getattr(onnxruntime, '__version__', 'installed')
+    except Exception as e:
+        deps['onnxruntime'] = f'NOT INSTALLED: {str(e)}'
+
     return jsonify({
         "dependencies": deps,
-        "opencv_available": 'cv2' in dir(),
-        "fal_api_configured": FAL_API_KEY is not None,
-        "ftp_configured": all([FTP_HOST, FTP_USER, FTP_PASS, FTP_BASE_URL])
+        "opencv_available": 'cv2' in dir()
     })
 
 @app.route('/admin', methods=['GET'])
@@ -703,6 +124,121 @@ def admin():
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "coffee_level": f"{random.randint(60, 100)}%"
     })
+
+
+
+# --------------------------------------------------------------------
+# Remove Background (remove.bg-like) - transparent PNG output
+# --------------------------------------------------------------------
+_RMBG_SESSION = None
+_RMBG_MODEL_NAME = os.environ.get('RMBG_MODEL', 'isnet-general-use')
+
+def _get_rmbg_session():
+    """Lazy-load the model once per worker process."""
+    global _RMBG_SESSION
+    if _RMBG_SESSION is not None:
+        return _RMBG_SESSION
+    if new_session is None:
+        return None
+    try:
+        _RMBG_SESSION = new_session(_RMBG_MODEL_NAME)
+    except Exception:
+        # Fallback to rembg default if env model name is unknown
+        _RMBG_SESSION = new_session()
+    return _RMBG_SESSION
+
+@app.route('/remove-bg', methods=['POST'])
+def remove_bg():
+    """
+    Remove background and return a transparent PNG.
+
+    Form-data:
+    - image: file (required)
+
+    Notes:
+    - For best results, install: rembg + onnxruntime (or onnxruntime-gpu on CUDA servers).
+    - Uses a strong general-purpose RMBG model by default (configurable by RMBG_MODEL env).
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    if remove is None:
+        return jsonify({
+            "error": "Dependency missing",
+            "message": "Background removal requires 'rembg' and 'onnxruntime'. Install them and redeploy."
+        }), 500
+
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+
+        # Read bytes
+        inp = file.read()
+        if not inp:
+            return jsonify({"error": "Empty file"}), 400
+
+        # Run RMBG
+        # alpha_matting improves edges (hair/soft boundaries) but is slower.
+        # We'll use a balanced default to feel closer to remove.bg.
+        session = _get_rmbg_session()
+        out = remove(
+            inp,
+            session=session,
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10
+        )
+
+        # Ensure output is a valid PNG
+        # (rembg usually returns PNG bytes already)
+        try:
+            img = Image.open(BytesIO(out)).convert('RGBA')
+        except Exception:
+            # If something odd happened, try treating bytes as raw image output
+            img = Image.open(BytesIO(out)).convert('RGBA')
+
+        # Optional: trim fully transparent border a little (keeps UX nice)
+        # Only crop if it doesn't remove all pixels.
+        arr = np.array(img)
+        alpha = arr[:, :, 3]
+        ys, xs = np.where(alpha > 0)
+        if ys.size > 0 and xs.size > 0:
+            y0, y1 = int(ys.min()), int(ys.max())
+            x0, x1 = int(xs.min()), int(xs.max())
+            # Add small padding
+            pad = 8
+            y0 = max(0, y0 - pad); x0 = max(0, x0 - pad)
+            y1 = min(img.height - 1, y1 + pad); x1 = min(img.width - 1, x1 + pad)
+            if (y1 - y0) > 2 and (x1 - x0) > 2:
+                img = img.crop((x0, y0, x1 + 1, y1 + 1))
+
+        output = BytesIO()
+        img.save(output, format='PNG', optimize=True)
+        output.seek(0)
+
+        resp = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='removed_bg.png'
+        )
+        resp.headers['X-RMBG-Model'] = str(_RMBG_MODEL_NAME)
+        resp.headers['X-RMBG-AlphaMatting'] = 'true'
+        return resp
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 @app.route('/smart-logo-variant', methods=['POST'])
 def smart_logo_variant():
@@ -1108,24 +644,29 @@ def smart_logo_variant():
             "traceback": traceback.format_exc()
         }), 500
 
-
 @app.route('/gen-logo-variant', methods=['POST'])
 def gen_logo_variant():
     """
-    GEN LOGO VARIANT (v3) - Full Pipeline + Autonomous Color Variant
-    
-    Only accepts: image (file)
-    
-    Pipeline:
-    1. Enhance image (fal.ai SeedVR Upscale) - if FAL_API_KEY configured
-    2. Remove background (rembg or fallback)
-    3. Trim whitespace
-    4. Generate color variant (auto-decided):
-       - If dark-ish => convert to white-ish
-       - If white-ish => convert to black-ish
-       - If neither => invert logo colors
-    
-    Returns: PNG image file (the variant)
+    GEN LOGO VARIANT (v1)
+    Always returns a *different* usable variant, while protecting gradients.
+
+    Priority rule:
+    1) If dark-ish pixels are > 30% of solid logo area:
+         -> ONLY convert dark-ish => white-ish (layered palette starting from pure white)
+         -> do NOT invert / swap
+
+    Otherwise:
+    2) If no dark-ish but there is white-ish:
+         -> convert white-ish => black-ish (layered)
+    3) If tiny dark-ish + lots of white-ish (e.g., black 'T' in white circle):
+         -> swap: dark-ish => white-ish AND white-ish => black-ish
+    4) If nothing changes:
+         -> INVERT logo colors (RGB negation) to guarantee a different output
+            (background remains untouched)
+
+    Notes:
+    - Gradient components are detected per connected-component and skipped.
+    - "Layer separation" is preserved by quantizing target pixels to 2..4 levels and mapping to a palette.
     """
 
     auth_error = verify_api_key()
@@ -1140,56 +681,39 @@ def gen_logo_variant():
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
 
-        # Read image bytes
-        image_bytes = file.read()
-        
-        # Track processing
-        enhance_status = "skipped"
-        bg_removal_method = "none"
-        
-        # ============================================================
-        # STEP 1: Enhance image (if fal.ai configured)
-        # ============================================================
-        if FAL_API_KEY:
-            image_bytes, enhanced, enhance_msg = enhance_image_fal(image_bytes)
-            enhance_status = "success" if enhanced else f"failed: {enhance_msg}"
-        
-        # Load as PIL Image
-        img = Image.open(BytesIO(image_bytes))
-        
-        # ============================================================
-        # STEP 2: Remove background
-        # ============================================================
-        # Check if already has transparency
-        has_transparency = False
-        if img.mode == 'RGBA':
-            alpha = np.array(img)[:, :, 3]
-            has_transparency = np.any(alpha < 255)
-        
-        if has_transparency:
-            img = img.convert('RGBA')
-            bg_removal_method = "already_transparent"
-        else:
-            img, bg_removal_method = remove_background(img)
-        
-        # ============================================================
-        # STEP 3: Trim whitespace
-        # ============================================================
-        img = trim_whitespace(img)
-        
-        # ============================================================
-        # STEP 4: Generate color variant (existing logic)
-        # ============================================================
+        # -----------------------
+        # Params (safe defaults)
+        # -----------------------
+        dark_thr = int(request.form.get('threshold', DEFAULT_THRESHOLD))
+        dark_thr = max(0, min(255, dark_thr))
+
+        white_threshold = int(request.form.get('white_threshold', 35))
+        white_threshold = max(1, min(80, white_threshold))
+        white_cut = 255 - white_threshold
+
+        alpha_min = int(request.form.get('alpha_min', 10))
+        alpha_min = max(0, min(255, alpha_min))
+
+        # Ratios
+        heavy_dark_cut = float(request.form.get('heavy_dark_ratio', 0.30))
+        heavy_dark_cut = max(0.0, min(1.0, heavy_dark_cut))
+
+        small_dark_ratio = float(request.form.get('small_dark_ratio', 0.02))
+        small_dark_ratio = max(0.0, min(1.0, small_dark_ratio))
+
+        high_white_ratio = float(request.form.get('high_white_ratio', 0.40))
+        high_white_ratio = max(0.0, min(1.0, high_white_ratio))
+
+        gradient_mode = request.form.get('gradient_mode', 'skip').lower().strip()
+        if gradient_mode not in ['skip', 'preserve', 'allow']:
+            gradient_mode = 'skip'
+
+        # -----------------------
+        # Load image
+        # -----------------------
+        img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
         h, w = data.shape[:2]
-
-        # Auto-configured params
-        dark_thr = 100
-        white_cut = 220
-        alpha_min = 10
-        heavy_dark_cut = 0.30
-        small_dark_ratio = 0.02
-        high_white_ratio = 0.40
 
         r = data[:, :, 0].astype(np.uint8)
         g = data[:, :, 1].astype(np.uint8)
@@ -1198,7 +722,9 @@ def gen_logo_variant():
 
         original = data.copy()
 
-        # Background detection
+        # ============================================================
+        # STEP 1: Background detection
+        # ============================================================
         corners = [data[0, 0], data[0, w - 1], data[h - 1, 0], data[h - 1, w - 1]]
         corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
         corner_a   = np.array([c[3]  for c in corners], dtype=np.float32)
@@ -1226,7 +752,7 @@ def gen_logo_variant():
                     (a > 200)
                 )
 
-            # Flood fill from corners
+            # Flood fill from corners to keep only corner-connected background
             potential_bg = (bg_mask.astype(np.uint8) * 255)
             connected_bg = np.zeros_like(potential_bg)
 
@@ -1244,15 +770,24 @@ def gen_logo_variant():
             logo_mask = (a > alpha_min)
             bg_mask = ~logo_mask
 
-        # Connected components
+        # ============================================================
+        # STEP 2: Connected components on logo pixels
+        # ============================================================
         mask_u8 = (logo_mask.astype(np.uint8) * 255)
         num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
 
-        # Luminance
+        # Luminance for decisions
         luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
 
-        # Gradient detection
+        # ============================================================
+        # STEP 3: Gradient detection per component
+        # ============================================================
         def is_gradient_component(comp_bool: np.ndarray) -> bool:
+            if gradient_mode == 'allow':
+                return False
+            if gradient_mode in ['skip', 'preserve']:
+                pass
+
             k = np.ones((3, 3), np.uint8)
             interior = cv2.erode(comp_bool.astype(np.uint8), k, iterations=1).astype(bool)
             if interior.sum() < 80:
@@ -1285,7 +820,9 @@ def gen_logo_variant():
             linear_gradient  = (r2 > 0.60 and lum_std > 8 and lum_rng > 20)
             return bool(entropy_gradient or linear_gradient)
 
-        # Solid-only stats
+        # ============================================================
+        # STEP 4: Solid-only stats to decide global mode
+        # ============================================================
         solid_logo_mask = np.zeros((h, w), dtype=bool)
 
         for lab in range(1, num_cc):
@@ -1295,7 +832,7 @@ def gen_logo_variant():
             comp = (cc_labels == lab) & logo_mask
             if comp.sum() == 0:
                 continue
-            if is_gradient_component(comp):
+            if gradient_mode in ['skip', 'preserve'] and is_gradient_component(comp):
                 continue
             solid_logo_mask |= comp
 
@@ -1313,7 +850,7 @@ def gen_logo_variant():
         dark_ratio  = dark_px  / max(1, solid_px)
         white_ratio = white_px / max(1, solid_px)
 
-        # Determine mode
+        # Priority: heavy dark => simple dark->white only
         mode = None
         if dark_ratio >= heavy_dark_cut:
             mode = "heavy-dark-to-white"
@@ -1329,15 +866,21 @@ def gen_logo_variant():
                     else:
                         mode = "invert-logo"
 
-        # Layered palette mapping
+        # ============================================================
+        # STEP 5: Layered palette mapping (prevents borders merging)
+        # ============================================================
         def apply_layered_palette(target_mask: np.ndarray, to: str):
+            """
+            Quantize luminance in target_mask into 2..4 levels and map to palette.
+            to: 'white' or 'black'
+            """
             ys, xs = np.where(target_mask)
             if ys.size == 0:
                 return 0
 
             lum = luminance[ys, xs].astype(np.float32)
+
             lum_rng = float(lum.max() - lum.min()) if lum.size else 0.0
-            
             if lum.size < 600 or lum_rng < 18:
                 K = 2
             elif lum_rng < 60:
@@ -1371,7 +914,9 @@ def gen_logo_variant():
 
             return int(ys.size)
 
-        # Apply transform
+        # ============================================================
+        # STEP 6: Apply transform per component (skip gradients)
+        # ============================================================
         changed_pixels = 0
         gradients_skipped = 0
 
@@ -1384,7 +929,11 @@ def gen_logo_variant():
             if int(np.sum(comp)) == 0:
                 continue
 
-            if is_gradient_component(comp):
+            comp_is_grad = False
+            if gradient_mode in ['skip', 'preserve'] and is_gradient_component(comp):
+                comp_is_grad = True
+
+            if comp_is_grad:
                 gradients_skipped += 1
                 continue
 
@@ -1393,28 +942,47 @@ def gen_logo_variant():
 
             if mode == "heavy-dark-to-white":
                 changed_pixels += apply_layered_palette(blackish, to='white')
+
             elif mode == "dark-to-white":
                 changed_pixels += apply_layered_palette(blackish, to='white')
+
             elif mode == "white-to-black":
                 changed_pixels += apply_layered_palette(whiteish, to='black')
+
             elif mode == "swap-bw":
                 changed_pixels += apply_layered_palette(blackish, to='white')
                 changed_pixels += apply_layered_palette(whiteish, to='black')
 
-        # Invert fallback
+            else:
+                # invert-logo handled later
+                pass
+
+        # ============================================================
+        # STEP 7: Invert logo fallback (guarantees a different file)
+        # ============================================================
+        # If nothing changed OR mode was invert-logo, invert RGB of logo pixels only
+        # Background remains completely untouched
         def invert_logo_colors():
             nonlocal changed_pixels
+
+            # Invert only logo pixels (non-background)
             logo_pixels = logo_mask & (a > alpha_min)
+            
             if not np.any(logo_pixels):
                 return
+
+            # Invert RGB channels for logo pixels only
             data[logo_pixels, 0] = 255 - data[logo_pixels, 0]
             data[logo_pixels, 1] = 255 - data[logo_pixels, 1]
             data[logo_pixels, 2] = 255 - data[logo_pixels, 2]
+            # Alpha channel remains unchanged
+
             changed_pixels += int(np.sum(logo_pixels))
 
         if mode == "invert-logo":
             invert_logo_colors()
         else:
+            # If result equals original (or no pixels changed), enforce inversion
             if changed_pixels == 0 or np.array_equal(data, original):
                 mode = "invert-logo"
                 invert_logo_colors()
@@ -1434,13 +1002,14 @@ def gen_logo_variant():
             download_name='gen_logo_variant.png'
         )
 
-        response.headers['X-Enhance-Status'] = enhance_status
-        response.headers['X-BG-Removal-Method'] = bg_removal_method
         response.headers['X-Variant-Mode'] = mode
         response.headers['X-Dark-Ratio'] = f"{dark_ratio:.4f}"
         response.headers['X-White-Ratio'] = f"{white_ratio:.4f}"
         response.headers['X-Changed-Pixels'] = str(int(changed_pixels))
         response.headers['X-Gradients-Skipped'] = str(int(gradients_skipped))
+        response.headers['X-Dark-Threshold'] = str(dark_thr)
+        response.headers['X-White-Threshold'] = str(white_threshold)
+        response.headers['X-Heavy-Dark-Cut'] = str(heavy_dark_cut)
 
         return response
 
@@ -1451,62 +1020,6 @@ def gen_logo_variant():
             "details": str(e),
             "traceback": traceback.format_exc()
         }), 500
-
-
-@app.route('/logo-type', methods=['POST'])
-def logo_type():
-    """
-    LOGO TYPE DETECTION
-    
-    Analyzes a logo and returns whether it's "black" or "white"
-    
-    Pipeline:
-    1. Remove background (if needed)
-    2. Trim whitespace
-    3. Analyze pixel luminance
-    4. Return type as plain text
-    
-    Returns: Plain text "black" or "white"
-    """
-    
-    auth_error = verify_api_key()
-    if auth_error:
-        return auth_error
-    
-    try:
-        if 'image' not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-        
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({"error": "Empty filename"}), 400
-        
-        # Load image
-        img = Image.open(file.stream)
-        
-        # Remove background if needed
-        has_transparency = False
-        if img.mode == 'RGBA':
-            alpha = np.array(img)[:, :, 3]
-            has_transparency = np.any(alpha < 255)
-        
-        if not has_transparency:
-            img, _ = remove_background(img)
-        else:
-            img = img.convert('RGBA')
-        
-        # Trim whitespace
-        img = trim_whitespace(img)
-        
-        # Determine type
-        logo_type_result, _, _ = determine_logo_type(img)
-        
-        # Return plain text
-        return logo_type_result, 200, {'Content-Type': 'text/plain'}
-    
-    except Exception as e:
-        return jsonify({"error": "Processing failed", "details": str(e)}), 500
-
 
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
