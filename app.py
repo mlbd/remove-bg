@@ -469,44 +469,51 @@ def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
 def remove_bg_endpoint():
     """
     🎯 Professional Background Removal - Automatic, remove.bg quality
-    
+
     Automatically analyzes the image and chooses the best removal method:
     - Logos/graphics with solid backgrounds → Color-based removal (keeps all text/elements)
     - Photos with complex backgrounds → AI model removal
-    
-    Just upload your image - the system handles everything automatically!
-    
+
     Parameters:
     -----------
     image: file (required)
         The image to process (PNG, JPG, WebP supported)
-    
+
     enhance: bool (optional, default=false)
         Upscale/enhance image using fal.ai API before background removal
-    
+
     trim: bool (optional, default=true)
         Auto-crop to remove extra transparent space (set to false to disable)
-    
+
     output_format: string (optional, default='png')
         Output format: 'png' or 'webp'
-    
+
+    bg_remove: string (optional, default='auto')
+        Controls which bg removal pipeline runs:
+        - auto  : remove_bg_smart (your current behavior)
+        - ai    : force rembg AI removal (remove_bg_ai_method)
+        - color : force solid-bg/logo removal (remove_bg_color_method)
+        - skip  : skip background removal entirely
+
     Returns:
     --------
-    PNG/WebP image with transparent background
-    
+    PNG/WebP image (transparent background unless bg_remove='skip')
+
     Headers:
+    - X-Bg-Remove: Requested mode (auto|ai|color|skip)
     - X-Method-Used: Which removal method was used
+    - X-Fallback-Used: Whether a forced method fell back to auto
     - X-Processing-Time: Time taken in seconds
     - X-Already-Transparent: Whether image was already transparent
     - X-Enhanced: Whether image was enhanced/upscaled
     """
     import time
     start_time = time.time()
-    
+
     auth_error = verify_api_key()
     if auth_error:
         return auth_error
-    
+
     try:
         # Validate input
         if 'image' not in request.files:
@@ -520,56 +527,103 @@ def remove_bg_endpoint():
                     "optional_fields": {
                         "enhance": "true | false (upscale/enhance before bg removal, default=false)",
                         "trim": "true | false (auto-crop transparent space, default=true)",
-                        "output_format": "png | webp"
+                        "output_format": "png | webp",
+                        "bg_remove": "auto | ai | color | skip (default=auto)"
                     },
-                    "example": "curl -X POST -F 'image=@photo.jpg' -F 'enhance=true' http://your-api/remove-bg -o result.png"
+                    "example": "curl -X POST -F 'image=@photo.jpg' -F 'bg_remove=ai' http://your-api/remove-bg -o result.png"
                 }
             }), 400
-        
+
         file = request.files['image']
-        
+
         # Read parameters
         do_enhance = request.form.get('enhance', 'false').lower() == 'true'
         do_trim = request.form.get('trim', 'true').lower() == 'true'
         output_format = request.form.get('output_format', 'png').lower()
-        
+
+        bg_remove = request.form.get('bg_remove', 'auto').strip().lower()
+        allowed_bg_remove = {'auto', 'ai', 'color', 'skip'}
+        if bg_remove not in allowed_bg_remove:
+            return jsonify({
+                "error": "Invalid bg_remove value",
+                "allowed": sorted(list(allowed_bg_remove)),
+                "received": bg_remove
+            }), 400
+
         # Read image bytes
         img_bytes = file.read()
-        
+
         # Check if image already has transparency
         already_transparent = has_transparency(img_bytes)
-        
+
         # STEP 1: Enhance image if requested (applies to both transparent and non-transparent)
         enhanced = False
         enhance_msg = "not requested"
-        
         if do_enhance:
             enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
             if enhanced:
                 img_bytes = enhanced_bytes
-        
-        # STEP 2: Background removal (only if not already transparent)
-        if already_transparent:
+
+        # STEP 2: Background removal
+        analysis = {}
+        fallback_used = False
+
+        if bg_remove == 'skip':
             # Skip background removal, just open the image
+            result_img = Image.open(BytesIO(img_bytes))
+            if result_img.mode != 'RGBA':
+                result_img = result_img.convert('RGBA')
+            method_used = 'skipped (bg_remove=skip)'
+
+        elif already_transparent:
+            # Keep existing behavior: skip bg removal if already transparent
             result_img = Image.open(BytesIO(img_bytes))
             if result_img.mode != 'RGBA':
                 result_img = result_img.convert('RGBA')
             method_used = 'skipped (already transparent)'
             analysis = {}
+
         else:
-            # Smart background removal - automatically chooses best method
-            result_img, method_used, analysis = remove_bg_smart(img_bytes)
-        
+            if bg_remove == 'auto':
+                # Smart background removal - automatically chooses best method
+                result_img, method_used, analysis = remove_bg_smart(img_bytes)
+
+            elif bg_remove == 'ai':
+                # Force AI removal
+                ai_img, ai_ok = remove_bg_ai_method(img_bytes)
+                if ai_ok and ai_img is not None:
+                    result_img = ai_img
+                    method_used = 'AI (forced)'
+                    analysis = {"forced": "ai"}
+                else:
+                    # Fallback to auto (more robust in production)
+                    fallback_used = True
+                    result_img, method_used, analysis = remove_bg_smart(img_bytes)
+                    method_used = f"{method_used} | fallback from AI"
+
+            elif bg_remove == 'color':
+                # Force color-based removal
+                try:
+                    img = Image.open(BytesIO(img_bytes))
+                    result_img = remove_bg_color_method(img)
+                    method_used = 'color-based (forced)'
+                    analysis = {"forced": "color"}
+                except Exception:
+                    # Fallback to auto if something unexpected happens
+                    fallback_used = True
+                    result_img, method_used, analysis = remove_bg_smart(img_bytes)
+                    method_used = f"{method_used} | fallback from color"
+
         # STEP 3: Refine edges (applies to both - run BEFORE trim for accurate boundaries)
         result_img = refine_edges(result_img, edge_smoothing=1)
-        
+
         # STEP 4: Trim whitespace if enabled (run AFTER edge refinement)
         if do_trim:
             result_img = trim_whitespace(result_img)
-        
+
         # Prepare output
         output = BytesIO()
-        
+
         if output_format == 'webp':
             result_img.save(output, format='WEBP', quality=95, lossless=False)
             mimetype = 'image/webp'
@@ -578,11 +632,11 @@ def remove_bg_endpoint():
             result_img.save(output, format='PNG', optimize=True)
             mimetype = 'image/png'
             extension = 'png'
-        
+
         output.seek(0)
-        
+
         processing_time = time.time() - start_time
-        
+
         # Return result
         response = send_file(
             output,
@@ -590,20 +644,25 @@ def remove_bg_endpoint():
             as_attachment=True,
             download_name=f'removed_bg.{extension}'
         )
-        
+
         # Add informative headers
+        response.headers['X-Bg-Remove'] = bg_remove
         response.headers['X-Method-Used'] = method_used
+        response.headers['X-Fallback-Used'] = str(fallback_used)
+
         response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
         response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
         response.headers['X-Already-Transparent'] = str(already_transparent)
+
         response.headers['X-Enhanced'] = str(enhanced)
         response.headers['X-Enhance-Status'] = enhance_msg
+
         response.headers['X-Trimmed'] = str(do_trim)
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
-        
+
         return response
-        
+
     except Exception as e:
         import traceback
         return jsonify({
@@ -611,6 +670,7 @@ def remove_bg_endpoint():
             "details": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
 
 @app.route('/remove-bg/info', methods=['GET'])
 def remove_bg_info():
