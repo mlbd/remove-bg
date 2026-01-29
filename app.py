@@ -17,6 +17,7 @@ app = Flask(__name__)
 # Environment variables
 API_KEY = os.environ.get('API_KEY', None)
 FAL_API_KEY = os.environ.get('FAL_API_KEY', None)  # For image enhancement
+FAL_KEY = os.environ.get('FAL_KEY', None)  # For image enhancement
 
 # FTP Configuration
 FTP_HOST = os.environ.get('FTP_HOST', None)
@@ -700,8 +701,8 @@ def remove_bg_endpoint():
         response.headers['X-Already-Transparent'] = str(already_transparent)
 
         response.headers['X-Enhanced'] = str(enhanced)
-        response.headers['X-Fal-Key'] = FAL_API_KEY
-        response.headers['X-Fal-Key-Present'] = 'true' if bool(os.getenv("FAL_KEY")) else 'false'
+        response.headers['X-FAL-API-KEY'] = FAL_API_KEY
+        response.headers['X-FAL-KEY'] = FAL_KEY
         response.headers['X-Enhance-Status'] = enhance_msg
 
         response.headers['X-Trimmed'] = str(do_trim)
