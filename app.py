@@ -536,66 +536,34 @@ def remove_bg_endpoint():
         # Read image bytes
         img_bytes = file.read()
         
-        # STEP 1: Check if image is already transparent
-        if has_transparency(img_bytes):
-            # Image already has transparency, return original
-            img = Image.open(BytesIO(img_bytes))
-            
-            # Trim whitespace if enabled (default=true)
-            if do_trim:
-                result_img = trim_whitespace(img)
-            else:
-                result_img = img
-            
-            # Prepare output
-            output = BytesIO()
-            
-            if output_format == 'webp':
-                result_img.save(output, format='WEBP', quality=95, lossless=False)
-                mimetype = 'image/webp'
-                extension = 'webp'
-            else:
-                result_img.save(output, format='PNG', optimize=True)
-                mimetype = 'image/png'
-                extension = 'png'
-            
-            output.seek(0)
-            processing_time = time.time() - start_time
-            
-            response = send_file(
-                output,
-                mimetype=mimetype,
-                as_attachment=True,
-                download_name=f'removed_bg.{extension}'
-            )
-            
-            response.headers['X-Method-Used'] = 'original (already transparent)'
-            response.headers['X-Already-Transparent'] = 'true'
-            response.headers['X-Enhanced'] = 'false'
-            response.headers['X-Trimmed'] = str(do_trim)
-            response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
-            response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
-            
-            return response
+        # Check if image already has transparency
+        already_transparent = has_transparency(img_bytes)
         
-        # STEP 2: Upscale/enhance the image using fal.ai API (only if enhance=true)
+        # STEP 1: Enhance image if requested (applies to both transparent and non-transparent)
         enhanced = False
         enhance_msg = "not requested"
         
         if do_enhance:
             enhanced_bytes, enhanced, enhance_msg = enhance_image_fal(img_bytes)
-            
-            # Use enhanced version if upscaling succeeded
             if enhanced:
                 img_bytes = enhanced_bytes
         
-        # STEP 3: Smart background removal - automatically chooses best method
-        result_img, method_used, analysis = remove_bg_smart(img_bytes)
+        # STEP 2: Background removal (only if not already transparent)
+        if already_transparent:
+            # Skip background removal, just open the image
+            result_img = Image.open(BytesIO(img_bytes))
+            if result_img.mode != 'RGBA':
+                result_img = result_img.convert('RGBA')
+            method_used = 'skipped (already transparent)'
+            analysis = {}
+        else:
+            # Smart background removal - automatically chooses best method
+            result_img, method_used, analysis = remove_bg_smart(img_bytes)
         
-        # Apply edge refinement
+        # STEP 3: Refine edges (applies to both - run BEFORE trim for accurate boundaries)
         result_img = refine_edges(result_img, edge_smoothing=1)
         
-        # STEP 4: Trim whitespace if enabled (default=true)
+        # STEP 4: Trim whitespace if enabled (run AFTER edge refinement)
         if do_trim:
             result_img = trim_whitespace(result_img)
         
@@ -627,7 +595,7 @@ def remove_bg_endpoint():
         response.headers['X-Method-Used'] = method_used
         response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
         response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
-        response.headers['X-Already-Transparent'] = 'false'
+        response.headers['X-Already-Transparent'] = str(already_transparent)
         response.headers['X-Enhanced'] = str(enhanced)
         response.headers['X-Enhance-Status'] = enhance_msg
         response.headers['X-Trimmed'] = str(do_trim)
@@ -643,7 +611,6 @@ def remove_bg_endpoint():
             "details": str(e),
             "traceback": traceback.format_exc()
         }), 500
-
 
 @app.route('/remove-bg/info', methods=['GET'])
 def remove_bg_info():
@@ -1011,25 +978,17 @@ def upload_images_to_ftp(images_dict, folder_id):
 @app.route('/process-logo', methods=['POST'])
 def process_logo():
     """
-    FULL LOGO PROCESSING PIPELINE (v2) - With FTP Upload
+    LOGO PROCESSING PIPELINE (v3) - With FTP Upload
     
     Accepts: image (file) - required
-    Optional params:
-        - enhance: 'true'/'false' (default: 'true') - Use fal.ai enhancement
-        - remove_bg: 'true'/'false' (default: 'true') - Remove background
-        - trim: 'true'/'false' (default: 'true') - Trim whitespace
     
     Pipeline:
-    1. Enhance image (fal.ai SeedVR Upscale)
-    2. Remove background (rembg or fallback)
-    3. Trim whitespace
-    4. Determine logo type (black-ish or white-ish)
-    5. Generate 4 versions:
-       - original_{type}: The processed original
+    1. Load image (expects transparent background already)
+    2. Determine logo type (black-ish or white-ish)
+    3. Generate 2 versions:
+       - original_{type}: The original
        - original_{opposite}: Color variant (inverted)
-       - bw_black: Solid black version
-       - bw_white: Solid white version
-    6. Create unique folder and upload all 4 to FTP
+    4. Create unique folder and upload both to FTP
     
     Returns: JSON with folder_id and image URLs
     
@@ -1060,11 +1019,6 @@ def process_logo():
                 "message": "Please set FTP_HOST, FTP_USER, FTP_PASS, and FTP_BASE_URL environment variables"
             }), 500
         
-        # Parse options
-        do_enhance = request.form.get('enhance', 'true').lower() == 'true'
-        do_remove_bg = request.form.get('remove_bg', 'true').lower() == 'true'
-        do_trim = request.form.get('trim', 'true').lower() == 'true'
-        
         # Read image bytes
         image_bytes = file.read()
         
@@ -1075,76 +1029,19 @@ def process_logo():
         processing_log = []
         
         # ============================================================
-        # STEP 1: Enhance image (optional)
+        # STEP 1: Load image
         # ============================================================
-        if do_enhance:
-            image_bytes, enhanced, enhance_msg = enhance_image_fal(image_bytes)
-            processing_log.append({
-                "step": "enhance",
-                "success": enhanced,
-                "message": enhance_msg
-            })
-        else:
-            processing_log.append({
-                "step": "enhance",
-                "success": False,
-                "message": "Skipped (disabled)"
-            })
-        
-        # Load as PIL Image
         img = Image.open(BytesIO(image_bytes))
+        img = img.convert('RGBA')
+        
+        processing_log.append({
+            "step": "load_image",
+            "success": True,
+            "size": f"{img.width}x{img.height}"
+        })
         
         # ============================================================
-        # STEP 2: Remove background (optional)
-        # ============================================================
-        if do_remove_bg:
-            # Check if already has transparency
-            has_transparency = False
-            if img.mode == 'RGBA':
-                alpha = np.array(img)[:, :, 3]
-                has_transparency = np.any(alpha < 255)
-            
-            if has_transparency:
-                img = img.convert('RGBA')
-                bg_method = "already_transparent"
-            else:
-                img, bg_method = remove_background(img)
-            
-            processing_log.append({
-                "step": "remove_background",
-                "success": True,
-                "method": bg_method
-            })
-        else:
-            img = img.convert('RGBA')
-            processing_log.append({
-                "step": "remove_background",
-                "success": False,
-                "message": "Skipped (disabled)"
-            })
-        
-        # ============================================================
-        # STEP 3: Trim whitespace (optional)
-        # ============================================================
-        if do_trim:
-            original_size = img.size
-            img = trim_whitespace(img)
-            new_size = img.size
-            processing_log.append({
-                "step": "trim",
-                "success": True,
-                "original_size": f"{original_size[0]}x{original_size[1]}",
-                "new_size": f"{new_size[0]}x{new_size[1]}"
-            })
-        else:
-            processing_log.append({
-                "step": "trim",
-                "success": False,
-                "message": "Skipped (disabled)"
-            })
-        
-        # ============================================================
-        # STEP 4: Determine logo type
+        # STEP 2: Determine logo type
         # ============================================================
         logo_type, dark_ratio, light_ratio = determine_logo_type(img)
         opposite_type = "white" if logo_type == "black" else "black"
@@ -1157,10 +1054,10 @@ def process_logo():
         })
         
         # ============================================================
-        # STEP 5: Generate all 4 versions
+        # STEP 3: Generate 2 versions
         # ============================================================
         
-        # Original (processed)
+        # Original
         original_key = f"original_{logo_type}"
         original_img = img.copy()
         
@@ -1168,26 +1065,18 @@ def process_logo():
         variant_key = f"original_{opposite_type}"
         variant_img = generate_variant(img, logo_type)
         
-        # Solid black
-        bw_black_img = generate_solid_version(img, "black")
-        
-        # Solid white
-        bw_white_img = generate_solid_version(img, "white")
-        
         processing_log.append({
             "step": "generate_versions",
             "success": True,
-            "versions": [original_key, variant_key, "bw_black", "bw_white"]
+            "versions": [original_key, variant_key]
         })
         
         # ============================================================
-        # STEP 6: Upload to FTP
+        # STEP 4: Upload to FTP
         # ============================================================
         images_to_upload = {
             f"{original_key}.png": original_img,
-            f"{variant_key}.png": variant_img,
-            "bw_black.png": bw_black_img,
-            "bw_white.png": bw_white_img
+            f"{variant_key}.png": variant_img
         }
         
         urls, ftp_status = upload_images_to_ftp(images_to_upload, folder_id)
@@ -1216,20 +1105,12 @@ def process_logo():
             "processing_log": processing_log,
             "images": {
                 original_key: {
-                    "description": f"Original processed logo ({logo_type})",
+                    "description": f"Original logo ({logo_type})",
                     "url": urls[f"{original_key}.png"]
                 },
                 variant_key: {
                     "description": f"Color variant ({opposite_type})",
                     "url": urls[f"{variant_key}.png"]
-                },
-                "bw_black": {
-                    "description": "Solid black version",
-                    "url": urls["bw_black.png"]
-                },
-                "bw_white": {
-                    "description": "Solid white version",
-                    "url": urls["bw_white.png"]
                 }
             }
         })
